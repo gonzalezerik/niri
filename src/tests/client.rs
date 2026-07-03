@@ -13,6 +13,7 @@ use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSingle
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{self, ZwpKeyboardShortcutsInhibitorV1};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_management_output_v1::{self, WpColorManagementOutputV1};
+use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_management_surface_feedback_v1::{self, WpColorManagementSurfaceFeedbackV1};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_management_surface_v1::WpColorManagementSurfaceV1;
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::{
     Primaries, RenderIntent, TransferFunction, WpColorManagerV1,
@@ -74,6 +75,15 @@ pub struct State {
     pub viewporter: Option<WpViewporter>,
     pub ksim: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     pub color_manager: Option<WpColorManagerV1>,
+    /// Feedback objects kept alive so preferred_changed events can arrive.
+    pub surface_feedbacks: Vec<WpColorManagementSurfaceFeedbackV1>,
+    /// Identities received in preferred_changed events, in order.
+    pub preferred_changed: Vec<u32>,
+    /// Identities received in wp_image_description_v1.ready events, in order.
+    pub ready_identities: Vec<u32>,
+    /// Named transfer function / primaries from the latest image description info exchange.
+    pub info_tf: Option<TransferFunction>,
+    pub info_primaries: Option<Primaries>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -275,6 +285,11 @@ impl Client {
             viewporter: None,
             ksim: None,
             color_manager: None,
+            surface_feedbacks: Vec::new(),
+            preferred_changed: Vec::new(),
+            ready_identities: Vec::new(),
+            info_tf: None,
+            info_primaries: None,
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -322,6 +337,30 @@ impl Client {
 
         let output_cm = manager.get_output(&output, &self.qh, ());
         let image = output_cm.get_image_description(&self.qh, ());
+        let _info = image.get_information(&self.qh, ());
+        self.connection.flush().unwrap();
+    }
+
+    /// Drives the color-management requests an HDR-aware client (SDL3) sends at startup: create a
+    /// surface feedback object and query the preferred image description and its information. The
+    /// feedback object is kept alive so later preferred_changed events arrive.
+    pub fn probe_surface_preferred(&mut self, surface: &WlSurface) {
+        let manager = self.state.color_manager.clone().expect("manager not bound");
+        let feedback = manager.get_surface_feedback(surface, &self.qh, ());
+        let image = feedback.get_preferred(&self.qh, ());
+        let _info = image.get_information(&self.qh, ());
+        self.state.surface_feedbacks.push(feedback);
+        self.connection.flush().unwrap();
+    }
+
+    /// Re-queries the preferred description (without creating a new feedback object) and its info.
+    pub fn requery_preferred(&mut self) {
+        let feedback = self
+            .state
+            .surface_feedbacks
+            .last()
+            .expect("no feedback object");
+        let image = feedback.get_preferred(&self.qh, ());
         let _info = image.get_information(&self.qh, ());
         self.connection.flush().unwrap();
     }
@@ -1121,27 +1160,74 @@ impl Dispatch<WpColorManagementOutputV1, ()> for State {
 
 impl Dispatch<WpImageDescriptionV1, ()> for State {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &WpImageDescriptionV1,
-        _event: wp_image_description_v1::Event,
+        event: wp_image_description_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        // ready / failed — ignored for these tests.
+        match event {
+            // v1 event; sent to clients binding wp_color_manager_v1 version 1.
+            wp_image_description_v1::Event::Ready { identity } => {
+                state.ready_identities.push(identity);
+            }
+            // v2+ replacement with a 64-bit identity.
+            wp_image_description_v1::Event::Ready2 {
+                identity_hi,
+                identity_lo,
+            } => {
+                assert_eq!(identity_hi, 0, "niri's identities fit in 32 bits");
+                state.ready_identities.push(identity_lo);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WpColorManagementSurfaceFeedbackV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpColorManagementSurfaceFeedbackV1,
+        event: wp_color_management_surface_feedback_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_color_management_surface_feedback_v1::Event::PreferredChanged { identity } => {
+                state.preferred_changed.push(identity);
+            }
+            wp_color_management_surface_feedback_v1::Event::PreferredChanged2 {
+                identity_hi,
+                identity_lo,
+            } => {
+                assert_eq!(identity_hi, 0, "niri's identities fit in 32 bits");
+                state.preferred_changed.push(identity_lo);
+            }
+            _ => {}
+        }
     }
 }
 
 impl Dispatch<WpImageDescriptionInfoV1, ()> for State {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &WpImageDescriptionInfoV1,
-        _event: wp_image_description_info_v1::Event,
+        event: wp_image_description_info_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
-        // primaries_named / tf_named / done / ... — ignored.
+        match event {
+            wp_image_description_info_v1::Event::TfNamed { tf } => {
+                state.info_tf = tf.into_result().ok();
+            }
+            wp_image_description_info_v1::Event::PrimariesNamed { primaries } => {
+                state.info_primaries = primaries.into_result().ok();
+            }
+            _ => {}
+        }
     }
 }
 
