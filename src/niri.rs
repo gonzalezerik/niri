@@ -2822,6 +2822,7 @@ impl Niri {
                 Feature::ExtendedTargetVolume,
                 Feature::SetLuminances,
                 Feature::WindowsScrgb,
+                Feature::WindowsBt2100,
             ],
             [RenderIntent::Perceptual],
             move |_client| advertise_color_management,
