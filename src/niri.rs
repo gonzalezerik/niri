@@ -2811,10 +2811,17 @@ impl Niri {
             ],
             [CmPrimaries::Srgb, CmPrimaries::Bt2020],
             // Mastering-metadata features so HDR clients can convey it without erroring.
+            // Extended target volume: the mastering metadata is forwarded to the sink (HDR
+            // infoframe) rather than used for gamut mapping, so target volumes exceeding the
+            // primary volume are fine. Windows scRGB: rendered with a dedicated blend-space
+            // encode (see `render_helpers::blend`).
             [
                 Feature::Parametric,
                 Feature::SetMasteringDisplayPrimaries,
+                Feature::SetPrimaries,
+                Feature::ExtendedTargetVolume,
                 Feature::SetLuminances,
+                Feature::WindowsScrgb,
             ],
             [RenderIntent::Perceptual],
             move |_client| advertise_color_management,
