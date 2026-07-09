@@ -1215,6 +1215,7 @@ impl Cast {
         cursor_data: &CursorData<CastRenderElement<GlesRenderer>>,
         size: Size<i32, Physical>,
         scale: Scale<f64>,
+        reference_luminance: f64,
     ) -> bool {
         let mut inner = self.inner.borrow_mut();
 
@@ -1311,8 +1312,15 @@ impl Cast {
             let res = match (*(*spa_buffer).datas).type_ {
                 x if x == DataType::DmaBuf.as_raw() => {
                     let dmabuf = inner_.dmabufs[&fd].clone();
-                    render_to_dmabuf(renderer, damage_tracker, dmabuf, elements, states)
-                        .map(|x| (x, SharingBuf::Dma))
+                    render_to_dmabuf(
+                        renderer,
+                        damage_tracker,
+                        dmabuf,
+                        elements,
+                        states,
+                        reference_luminance,
+                    )
+                    .map(|x| (x, SharingBuf::Dma))
                 }
                 x if x == DataType::MemFd.as_raw() => {
                     let shmbuf = &inner_.shmbufs[&fd];
