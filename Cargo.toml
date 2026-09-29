@@ -189,5 +189,5 @@ assets = [
 # Local smithay with connector color state support (HDR) and the color-management
 # protocol from Smithay PR #1143. To be removed once both are upstream.
 [patch."https://github.com/Smithay/smithay.git"]
-smithay = { path = "../smithay" }
-smithay-drm-extras = { path = "../smithay/smithay-drm-extras" }
+smithay = { git = "https://github.com/dividebysandwich/smithay.git", rev = "57c805c8e6d0b34601b07d89053b376905008d8a" }
+smithay-drm-extras = { git = "https://github.com/dividebysandwich/smithay.git", rev = "57c805c8e6d0b34601b07d89053b376905008d8a" }
