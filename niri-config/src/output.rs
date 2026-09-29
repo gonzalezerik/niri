@@ -58,6 +58,8 @@ pub struct Output {
     #[knuffel(child, unwrap(argument, str), default = Transform::Normal)]
     pub transform: Transform,
     #[knuffel(child)]
+    pub auto_rotate: bool,
+    #[knuffel(child)]
     pub position: Option<Position>,
     #[knuffel(child, unwrap(argument))]
     pub max_bpc: Option<MaxBpc>,
@@ -104,6 +106,7 @@ impl Default for Output {
             name: String::new(),
             scale: None,
             transform: Transform::Normal,
+            auto_rotate: false,
             position: None,
             max_bpc: None,
             hdr: None,
