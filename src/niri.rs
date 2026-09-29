@@ -2484,6 +2484,14 @@ impl State {
 }
 
 impl Niri {
+    /// Whether `output` is showing a fullscreen window.
+    pub fn output_has_fullscreen_window(&self, output: &Output) -> bool {
+        self.layout
+            .monitor_for_output(output)
+            .and_then(|mon| mon.active_window())
+            .is_some_and(|window| window.sizing_mode().is_fullscreen())
+    }
+
     /// For fullscreen HDR passthrough: if `output` is showing a fullscreen window whose surface
     /// carries an HDR (PQ / BT.2020) image description, returns that description. The TTY backend
     /// uses this to decide whether to signal HDR on the connector in auto mode, and which metadata
