@@ -2590,9 +2590,13 @@ impl Niri {
     ///
     /// With `hdr mode="on"`, every window on the output is told to prefer PQ upfront — this is
     /// what lets applications that only probe HDR support once at startup (e.g. many SDL
-    /// games) detect it. In auto mode, only the active fullscreen window is told to prefer PQ
-    /// (even while its content is still SDR): clients that listen for `preferred_changed`
-    /// then switch to HDR output, which in turn engages HDR on the connector.
+    /// games) detect it. In auto mode, every fullscreen window is told to prefer PQ, active
+    /// or not (even while its content is still SDR): clients that listen for
+    /// `preferred_changed` then switch to HDR output, and clients that probe HDR support once
+    /// at surface creation — like the gamescope WSI layer — see it regardless of focus. HDR
+    /// engages on the connector only while the *active* fullscreen window carries HDR content
+    /// (see `output_hdr_image_description`), so an unfocused fullscreen window that prefers PQ
+    /// renders through the SDR tone-map path without switching the connector.
     fn preferred_description_for_window(
         &self,
         window: &Mapped,
@@ -2604,13 +2608,14 @@ impl Niri {
         match hdr.mode {
             HdrMode::On => Self::hdr_blend_description(&hdr, caps),
             HdrMode::Auto => {
-                let is_active_fullscreen = window.sizing_mode().is_fullscreen()
-                    && self
-                        .layout
-                        .monitor_for_output(output)
-                        .and_then(|mon| mon.active_window())
-                        .is_some_and(|active| active.id() == window.id());
-                if is_active_fullscreen {
+                // Count a window as fullscreen once fullscreen has been requested of it, not only
+                // after it acks that configure. A window that maps (or re-maps) straight into
+                // fullscreen is otherwise told to prefer sRGB until its ack commits, and clients
+                // that check HDR support at that moment (gamescope nested, which unmaps and
+                // re-maps its toplevel while the game inside switches windows) see no HDR.
+                let is_fullscreen = window.sizing_mode().is_fullscreen()
+                    || window.pending_sizing_mode().is_fullscreen();
+                if is_fullscreen {
                     Self::hdr_blend_description(&hdr, caps)
                 } else {
                     ImageDescription::SRGB
