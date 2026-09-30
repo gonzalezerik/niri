@@ -1,3 +1,101 @@
+# niri, HDR branch (`erikg-hdr`)
+
+> **Built with LLM assistance.** The features and fixes I add in this fork are written with the help of large language models, specifically Qwen 3.8 Flash-Next. niri doesn't accept LLM-assisted contributions, so I will never submit them to [niri-wm/niri](https://github.com/niri-wm/niri); they stay in this fork. dividebysandwich's HDR work and the commits picked in from niri pull requests are their authors' own.
+
+This is my personal build of [niri](https://github.com/niri-wm/niri), the scrollable-tiling Wayland compositor. I run it on my ASUS ProArt PX13 laptop (AMD Radeon 8060S) and my desktop (NVIDIA RTX 5070 Ti). It is not an official niri release and is not affiliated with the niri project.
+
+## Where it comes from
+
+```
+niri-wm/niri                    upstream niri (no HDR yet)
+└── dividebysandwich/niri       hdr-smithay-master: HDR through Smithay color management
+    └── gonzalezerik/niri       erikg-hdr (this branch): the fixes and extras below
+```
+
+Upstream niri doesn't support HDR yet; that depends on color management landing in [Smithay](https://github.com/Smithay/smithay). Until then, this branch builds on [dividebysandwich/niri](https://github.com/dividebysandwich/niri)'s HDR work.
+
+## What this branch adds
+
+**HDR fixes**, each also submitted to dividebysandwich/niri:
+
+| Fix | Pull request |
+|---|---|
+| Don't free the swapchain on blend-space changes (AMD GPU page fault after leaving HDR) | [#4](https://github.com/dividebysandwich/niri/pull/4) |
+| Wait for the 10-bit probe frame before discarding its buffers | [#5](https://github.com/dividebysandwich/niri/pull/5) |
+| Ride out a momentary loss of the HDR description (HDR → SDR → HDR blanking when mpv goes fullscreen) | [#6](https://github.com/dividebysandwich/niri/pull/6) |
+| Prefer HDR for a window as soon as it is told to go fullscreen (games in nested gamescope starting in SDR) | [#7](https://github.com/dividebysandwich/niri/pull/7) |
+
+**Per-output color profiles** (only in this branch): color correction from an ICC profile or the display's EDID, applied in the GPU's display pipeline, similar to KDE Plasma's "Color profile" setting. See [Configuration: Color Profiles](docs/wiki/Configuration:-Color-Profiles.md).
+
+**Auto-rotate** (only in this branch): rotates an output from the accelerometer through iio-sensor-proxy, for 2-in-1 laptops like the PX13. Carried from [niri-wm/niri#3763](https://github.com/niri-wm/niri/pull/3763) by Rio Sanjaya ([@oisanjaya](https://github.com/oisanjaya)), squashed into one commit; all credit to them. It is an opt-in build feature, so desktops don't run the accelerometer watcher: build with `cargo build --release --features auto-rotate`.
+
+**Float above fullscreen** (until upstream merges it): the `float-above-fullscreen` window rule keeps a floating window visible over a focused fullscreen window, e.g. a picture-in-picture video over a game. Carried from [niri-wm/niri#4062](https://github.com/niri-wm/niri/pull/4062) by Zhai Can ([@bczhc](https://github.com/bczhc)), with the original commits.
+
+**HDR capture** (only in this branch): captured dmabuf buffers hold the output's own encoding — PQ/BT.2020 while the output's `wp_color_management_output_v1` image description says PQ, sRGB otherwise — so HDR streams (e.g. Sunshine) get correct pixels through the existing color-management protocol, no new protocol. The buffer format is a precision choice only: pick a 10-bit (e.g. `XR30`) or FP16 format for HDR captures to avoid banding. shm capture stays the SDR tone-map of the output, since shm buffers cannot carry a color description. wlr-screencopy (and thus PipeWire) dmabuf buffers follow the same contract.
+
+## Using it
+
+Build it the same way as upstream niri. Smithay comes from [gonzalezerik/smithay](https://github.com/gonzalezerik/smithay) `erikg-hdr-smithay` (my fork of [dividebysandwich/smithay](https://github.com/dividebysandwich/smithay) `ds-hdr-master`), pinned in `Cargo.toml`, so no local Smithay checkout is needed.
+
+```kdl
+output "eDP-1" {
+    hdr mode="auto"   // HDR while a fullscreen app shows HDR content
+    auto-rotate       // follow the accelerometer (needs --features auto-rotate and iio-sensor-proxy)
+}
+
+color-profile "eDP-1" {
+    source "icc"
+    icc "~/.local/share/icc/panel.icm"
+}
+```
+
+- HDR options: [Configuration: Outputs, `hdr`](docs/wiki/Configuration:-Outputs.md#hdr). HDR is experimental: it is limited to a single fullscreen application, and screenshots of HDR content come out in SDR.
+- Color profiles: [Configuration: Color Profiles](docs/wiki/Configuration:-Color-Profiles.md).
+
+## Bugs encountered
+
+Bugs I hit while running this branch on my two machines, in the compositor and in the apps used with it. I don't open pull requests on niri or comment on upstream issues from this fork; this is the record.
+
+### HDR, gaming and video
+
+| Bug | In | Upstream issue | Fix |
+|---|---|---|---|
+| The branch didn't build on its own: `Cargo.toml` pointed Smithay at a local `../smithay` checkout | dividebysandwich/niri | none (issues are disabled on that repository) | Pinned to `dividebysandwich/smithay` `ds-hdr-master` ([6fa1bda3](https://github.com/gonzalezerik/niri/commit/6fa1bda3)) |
+| AMD GPU page fault, freezing the desktop, right after leaving HDR | dividebysandwich/niri | none | [0a94298b](https://github.com/gonzalezerik/niri/commit/0a94298b), PR [#4](https://github.com/dividebysandwich/niri/pull/4) |
+| The 10-bit probe frame's buffers were freed while the GPU could still be using them | dividebysandwich/niri | none | [724d3eb0](https://github.com/gonzalezerik/niri/commit/724d3eb0), PR [#5](https://github.com/dividebysandwich/niri/pull/5) |
+| HDR → SDR → HDR (three mode switches) every time mpv goes fullscreen | dividebysandwich/niri | none | [08691922](https://github.com/gonzalezerik/niri/commit/08691922), PR [#6](https://github.com/dividebysandwich/niri/pull/6) |
+| Games in nested gamescope start in SDR | dividebysandwich/niri | none | [bc31fd6d](https://github.com/gonzalezerik/niri/commit/bc31fd6d), PR [#7](https://github.com/dividebysandwich/niri/pull/7) |
+| A game in nested gamescope stays SDR for the whole session if another window had focus when it created its swapchain | this branch's HDR (HDR is only offered to the focused fullscreen window) together with gamescope | none | Not fixed in niri. Workaround: `--hdr-debug-force-support` in the game's gamescope launch option |
+| Nested gamescope loses its `app_id` after its window is unmapped, so the `^gamescope$` VRR window rule stops matching | gamescope | [ValveSoftware/gamescope#2446](https://github.com/ValveSoftware/gamescope/issues/2446) (closed) | Fixed upstream in [e0602ccc](https://github.com/ValveSoftware/gamescope/commit/e0602ccc313b6dee0dabb09c67e50a28eb784de9), not in a release yet (3.16.31); my NixOS config applies that commit to gamescope |
+| Spider-Man Remastered crashes gamescope: gamescope passes on the game's invalid HDR metadata and niri rejects it with a protocol error | gamescope | none for this case; related: [ValveSoftware/gamescope#2249](https://github.com/ValveSoftware/gamescope/issues/2249) | niri is right to reject it. Workaround: the game's peak-brightness setting raised to the display's real peak |
+| Firefox is disconnected mid-video: its `wp_viewport` source rectangle overshoots the buffer by 1/256 px | Firefox | [Mozilla bug 2062135](https://bugzilla.mozilla.org/show_bug.cgi?id=2062135) (assigned, patch in review) | niri follows the protocol here, so nothing to fix in niri. Firefox is no longer installed on either machine |
+| Jellium Desktop's Wayland proxy deletes Flatpak's link to the compositor socket, so every later launch fails with "Connection refused" | Jellium Desktop | none | Flatpak override `--filesystem=xdg-run/wayland-1.lock:ro` |
+
+### Virtual outputs
+
+Bugs found while building virtual outputs on [niri-wm/niri#3800](https://github.com/niri-wm/niri/pull/3800). That work is on a separate local branch and is not in `erikg-hdr` yet; the commit ids below are on that branch.
+
+| Bug | In | Upstream issue | Fix |
+|---|---|---|---|
+| Clients on a virtual output never get a frame reported as presented, so frame pacing falls back to guesswork | #3800 | none | `1b8ef36a` |
+| #3800's redraw change also delays physical monitors by up to one refresh | #3800 | none | `1b8ef36a` (the change now applies to virtual outputs only) |
+| `power-off-monitors` also stops virtual outputs, so a remote stream drops to about 1 frame per second; locking while monitors are off counted the session as locked without drawing the lock screen on them | #3800 | none; related, for physical monitors: [niri-wm/niri#3295](https://github.com/niri-wm/niri/issues/3295) (open) | `981ad038` |
+| The headless backend renders on whichever GPU EGL picks, possibly software rendering, so capture clients like Sunshine lose zero-copy | #3800 | none | `e14d229a` (renders on `debug { render-drm-device }`) |
+| A refresh rate of 0 or an extreme value is accepted (0 divides by zero) | #3800 | none; flagged in review on [niri-wm/niri#3953](https://github.com/niri-wm/niri/pull/3953) | `defe8a89` |
+| On a machine with Mesa and the NVIDIA driver, the render node could be opened through the wrong EGL vendor and fall back to an arbitrary GPU | my own `e14d229a` | none | `0b20ed59` |
+
+### No bugs found so far
+
+Auto-rotate, per-output color profiles and the `float-above-fullscreen` window rule.
+
+## Status
+
+Personal and experimental; tested only on my two machines. Please don't report problems with this branch to upstream niri.
+
+---
+
+*The original niri README follows.*
+
 <h1 align="center"><img alt="niri" src="https://github.com/user-attachments/assets/07d05cd0-d5dc-4a28-9a35-51bae8f119a0"></h1>
 <p align="center">A scrollable-tiling Wayland compositor.</p>
 <p align="center">
