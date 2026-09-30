@@ -1,3 +1,59 @@
+# niri, HDR branch (`erikg-hdr`)
+
+This is my personal build of [niri](https://github.com/niri-wm/niri), the scrollable-tiling Wayland compositor. I run it on my ASUS ProArt PX13 laptop (AMD Radeon 8060S) and my desktop (NVIDIA RTX 5070 Ti). It is not an official niri release and is not affiliated with the niri project.
+
+## Where it comes from
+
+```
+niri-wm/niri                    upstream niri (no HDR yet)
+└── dividebysandwich/niri       hdr-smithay-master: HDR through Smithay color management
+    └── gonzalezerik/niri       erikg-hdr (this branch): the fixes and extras below
+```
+
+Upstream niri doesn't support HDR yet; that depends on color management landing in [Smithay](https://github.com/Smithay/smithay). Until then, this branch builds on [dividebysandwich/niri](https://github.com/dividebysandwich/niri)'s HDR work.
+
+## What this branch adds
+
+**HDR fixes**, each also submitted to dividebysandwich/niri:
+
+| Fix | Pull request |
+|---|---|
+| Don't free the swapchain on blend-space changes (AMD GPU page fault after leaving HDR) | [#4](https://github.com/dividebysandwich/niri/pull/4) |
+| Wait for the 10-bit probe frame before discarding its buffers | [#5](https://github.com/dividebysandwich/niri/pull/5) |
+| Ride out a momentary loss of the HDR description (HDR → SDR → HDR blanking when mpv goes fullscreen) | [#6](https://github.com/dividebysandwich/niri/pull/6) |
+| Prefer HDR for a window as soon as it is told to go fullscreen (games in nested gamescope starting in SDR) | [#7](https://github.com/dividebysandwich/niri/pull/7) |
+
+**Per-output color profiles** (only in this branch): color correction from an ICC profile or the display's EDID, applied in the GPU's display pipeline, similar to KDE Plasma's "Color profile" setting. See [Configuration: Color Profiles](docs/wiki/Configuration:-Color-Profiles.md).
+
+**Auto-rotate** (only in this branch): rotates an output from the accelerometer through iio-sensor-proxy, for 2-in-1 laptops like the PX13. Carried from [niri-wm/niri#3763](https://github.com/niri-wm/niri/pull/3763) by Rio Sanjaya ([@oisanjaya](https://github.com/oisanjaya)), squashed into one commit; all credit to them.
+
+## Using it
+
+Build it the same way as upstream niri. Smithay comes from [dividebysandwich/smithay](https://github.com/dividebysandwich/smithay) `ds-hdr-master`, pinned in `Cargo.toml`, so no local Smithay checkout is needed.
+
+```kdl
+output "eDP-1" {
+    hdr mode="auto"   // HDR while a fullscreen app shows HDR content
+    auto-rotate       // follow the accelerometer (needs iio-sensor-proxy)
+}
+
+color-profile "eDP-1" {
+    source "icc"
+    icc "~/.local/share/icc/panel.icm"
+}
+```
+
+- HDR options: [Configuration: Outputs, `hdr`](docs/wiki/Configuration:-Outputs.md#hdr). HDR is experimental: it is limited to a single fullscreen application, and screenshots of HDR content come out in SDR.
+- Color profiles: [Configuration: Color Profiles](docs/wiki/Configuration:-Color-Profiles.md).
+
+## Status
+
+Personal and experimental; tested only on my two machines. Please don't report problems with this branch to upstream niri.
+
+---
+
+*The original niri README follows.*
+
 <h1 align="center"><img alt="niri" src="https://github.com/user-attachments/assets/07d05cd0-d5dc-4a28-9a35-51bae8f119a0"></h1>
 <p align="center">A scrollable-tiling Wayland compositor.</p>
 <p align="center">
