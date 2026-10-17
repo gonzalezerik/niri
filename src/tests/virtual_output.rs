@@ -685,6 +685,27 @@ fn pump_presentation_loops(
     t0.elapsed()
 }
 
+/// Pump until `cond` holds or `timeout` elapses. Returns whether the condition was met.
+fn pump_until(
+    f: &mut Fixture,
+    id: client::ClientId,
+    timeout: std::time::Duration,
+    cond: impl Fn(&client::Client) -> bool,
+) -> bool {
+    let t0 = std::time::Instant::now();
+    loop {
+        f.dispatch();
+        f.client(id).dispatch();
+        if cond(f.client(id)) {
+            return true;
+        }
+        if t0.elapsed() > timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// A fixture with a single virtual output at `mode` and one client window on it, running a
 /// commit-on-every-frame-callback loop with presentation feedbacks.
 fn presentation_fixture(
@@ -824,6 +845,124 @@ fn virtual_output_presentation_feedback_2560x1440_at_120hz() {
     }
 
     assert!(presented > 0, "no presented events");
+}
+
+/// Virtual outputs keep rendering (and pacing) while physical monitors are powered off via
+/// `power-off-monitors` (DPMS): their buffers feed capture clients, unlike a CRTC with no
+/// framebuffer attached.
+#[test]
+fn virtual_output_keeps_presenting_while_monitors_powered_off() {
+    let (mut f, id, surface) = presentation_fixture(niri_ipc::ConfiguredMode {
+        width: 800,
+        height: 600,
+        refresh: Some(100.0),
+    });
+
+    // Baseline with monitors on.
+    pump_presentation_loops(
+        &mut f,
+        id,
+        Some(surface.clone()),
+        std::time::Duration::from_millis(500),
+    );
+    let baseline = presented_count(&f, id, &surface);
+    assert!(baseline > 0, "no presented events with monitors on");
+
+    {
+        let state = f.niri_state();
+        state.niri.deactivate_monitors(&mut state.backend);
+    }
+
+    let before = presented_count(&f, id, &surface);
+    let elapsed = pump_presentation_loops(
+        &mut f,
+        id,
+        Some(surface.clone()),
+        std::time::Duration::from_millis(500),
+    );
+    let presented = presented_count(&f, id, &surface) - before;
+
+    let expected = elapsed.as_secs_f64() * 100.0;
+    assert!(
+        presented as f64 >= expected * 0.6,
+        "{presented} presented events in {elapsed:?} with monitors powered off; \
+         the virtual output must keep rendering at its mode rate (expected ~{expected:.0})",
+    );
+}
+
+/// Locking while monitors are powered off must actually render the lock surface on the virtual
+/// output before the session counts as locked: the output keeps displaying its buffer to
+/// capture clients, so it can't be treated like a powered-off CRTC with nothing attached.
+#[test]
+fn lock_while_monitors_powered_off_renders_lock_surface() {
+    use std::sync::atomic::Ordering;
+
+    let mut f = Fixture::new();
+
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(
+                &mut state.niri,
+                Some(niri_ipc::ConfiguredMode {
+                    width: 800,
+                    height: 600,
+                    refresh: Some(100.0),
+                }),
+                Some("virt".to_owned()),
+            )
+            .unwrap()
+    };
+
+    pump_server_every_ms(&mut f, 1);
+
+    let id = f.add_client();
+    // Let the output name events arrive before looking the output up by name.
+    f.double_roundtrip(id);
+
+    {
+        let state = f.niri_state();
+        state.niri.deactivate_monitors(&mut state.backend);
+    }
+
+    let client_output = f.client(id).output(&name);
+    {
+        let client = f.client(id);
+        client.lock(&client_output);
+    }
+
+    // Wait for the lock surface configure.
+    let configured = pump_until(&mut f, id, std::time::Duration::from_secs(2), |c| {
+        c.state.locks.first().is_some_and(|l| l.configure.is_some())
+    });
+    assert!(configured, "no configure for the lock surface");
+
+    // Commit the lock surface, asking for a presentation feedback with the frame.
+    f.client(id).state.locks[0].ack_and_commit_with_feedback();
+
+    // The session must become locked, and only after the lock surface was actually rendered
+    // (the feedback is presented from the render path). Before the fix, `locked` arrived via
+    // the powered-off-CRTC shortcut with zero presented feedbacks.
+    let locked = pump_until(&mut f, id, std::time::Duration::from_secs(2), |c| {
+        c.state
+            .locks
+            .first()
+            .is_some_and(|l| l.locked.load(Ordering::Relaxed))
+    });
+    assert!(locked, "session never locked");
+
+    let lock = &f.client(id).state.locks[0];
+    assert!(
+        lock.presented >= 1,
+        "session locked without rendering the lock surface (presented: {}, discarded: {})",
+        lock.presented,
+        lock.feedback_discarded,
+    );
+    assert!(
+        !lock.finished.load(Ordering::Relaxed),
+        "session lock was finished (unlocked) unexpectedly",
+    );
 }
 
 #[test]

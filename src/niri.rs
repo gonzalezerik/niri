@@ -5321,8 +5321,13 @@ impl Niri {
 
         self.update_render_elements(Some(output));
 
+        // Virtual outputs keep rendering while monitors are powered off: their buffers are
+        // visible to capture clients (e.g. a remote-desktop stream), unlike a TTY CRTC which
+        // has no framebuffer attached when inactive.
+        let is_virtual = VirtualOutputMarker::is_virtual(output);
+
         let mut res = RenderResult::Skipped;
-        if self.monitors_active {
+        if self.monitors_active || is_virtual {
             let state = self.output_state.get_mut(output).unwrap();
             state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
             state.unfinished_animations_remain |=
@@ -5366,8 +5371,15 @@ impl Niri {
 
         // Update the lock render state on successful render, or if monitors are inactive. When
         // monitors are inactive on a TTY, they have no framebuffer attached, so no sensitive data
-        // from a last render will be visible.
-        if res != RenderResult::Skipped || !self.monitors_active {
+        // from a last render will be visible. Virtual outputs keep rendering while monitors are
+        // inactive, so they must actually render the locked frame before the session counts as
+        // locked. A failed render comes back as `Skipped`, so it never advances the lock state
+        // for a virtual output.
+        let lock_ok = match res {
+            RenderResult::Submitted | RenderResult::NoDamage => true,
+            RenderResult::Skipped => !self.monitors_active && !is_virtual,
+        };
+        if lock_ok {
             state.lock_render_state = if is_locked {
                 LockRenderState::Locked
             } else {
@@ -5415,7 +5427,6 @@ impl Niri {
         //
         // However, this should probably be restricted to sending frame callbacks to more surfaces,
         // to err on the safe side.
-        let is_virtual = crate::backend::VirtualOutputMarker::is_virtual(output);
         if is_virtual {
             self.send_frame_callbacks_for_virtual_output(output);
         } else {

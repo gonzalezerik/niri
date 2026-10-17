@@ -12,6 +12,13 @@ use calloop_wayland_source::WaylandSource;
 use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{self, ZwpKeyboardShortcutsInhibitorV1};
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1::ExtSessionLockManagerV1;
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_surface_v1::{
+    self as ext_session_lock_surface_v1, ExtSessionLockSurfaceV1,
+};
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_v1::{
+    self as ext_session_lock_v1, ExtSessionLockV1,
+};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_management_output_v1::{self, WpColorManagementOutputV1};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_management_surface_feedback_v1::{self, WpColorManagementSurfaceFeedbackV1};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_color_management_surface_v1::WpColorManagementSurfaceV1;
@@ -105,9 +112,11 @@ pub struct State {
     /// Count of image_description_changed events received on output objects.
     pub output_image_description_changed: usize,
     pub presentation: Option<WpPresentation>,
+    pub session_lock_manager: Option<ExtSessionLockManagerV1>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
+    pub locks: Vec<Lock>,
 }
 
 pub struct Window {
@@ -131,6 +140,34 @@ pub struct Window {
     pub feedback_discarded: usize,
     pub presented_at: Vec<Duration>,
     pub pres_start: Option<Instant>,
+}
+
+/// A session lock and its lock surface, for testing lock rendering.
+pub struct Lock {
+    pub qh: QueueHandle<State>,
+    pub spbm: WpSinglePixelBufferManagerV1,
+    pub presentation: Option<WpPresentation>,
+
+    /// Kept to hold the lock proxy alive for the lifetime of the test.
+    #[allow(dead_code)]
+    pub lock: ExtSessionLockV1,
+    pub surface: WlSurface,
+    pub lock_surface: ExtSessionLockSurfaceV1,
+    pub viewport: WpViewport,
+
+    pub locked: Arc<AtomicBool>,
+    pub finished: Arc<AtomicBool>,
+    pub configure: Option<(u32, u32, u32)>,
+
+    pub frame_callbacks: usize,
+    pub presented: usize,
+    pub feedback_discarded: usize,
+}
+
+#[derive(Clone, Default)]
+pub struct LockFlags {
+    pub locked: Arc<AtomicBool>,
+    pub finished: Arc<AtomicBool>,
 }
 
 pub struct LayerSurface {
@@ -326,8 +363,10 @@ impl Client {
             color_management_surfaces: Vec::new(),
             output_image_description_changed: 0,
             presentation: None,
+            session_lock_manager: None,
             windows: Vec::new(),
             layers: Vec::new(),
+            locks: Vec::new(),
         };
 
         Self {
@@ -594,6 +633,10 @@ impl Client {
             .0
             .clone()
     }
+
+    pub fn lock(&mut self, output: &WlOutput) -> &mut Lock {
+        self.state.lock(output)
+    }
 }
 
 impl State {
@@ -705,6 +748,56 @@ impl State {
         let ksim = self.ksim.as_ref().unwrap();
         let seat = self.seats.keys().next().unwrap();
         ksim.inhibit_shortcuts(surface, seat, &self.qh, ())
+    }
+
+    /// Lock the session and create a lock surface for `output`.
+    pub fn lock(&mut self, output: &WlOutput) -> &mut Lock {
+        let manager = self.session_lock_manager.as_ref().unwrap().clone();
+        let viewporter = self.viewporter.as_ref().unwrap().clone();
+        let spbm = self.spbm.as_ref().unwrap().clone();
+
+        let flags = LockFlags::default();
+        let lock = manager.lock(&self.qh, flags.clone());
+        let surface = self.create_surface();
+        let lock_surface = lock.get_lock_surface(&surface, output, &self.qh, self.locks.len());
+        let viewport = viewporter.get_viewport(&surface, &self.qh, ());
+
+        self.locks.push(Lock {
+            qh: self.qh.clone(),
+            spbm,
+            presentation: self.presentation.clone(),
+            lock,
+            surface,
+            lock_surface,
+            viewport,
+            locked: flags.locked,
+            finished: flags.finished,
+            configure: None,
+            frame_callbacks: 0,
+            presented: 0,
+            feedback_discarded: 0,
+        });
+
+        self.locks.last_mut().unwrap()
+    }
+}
+
+impl Lock {
+    /// Ack the last configure, attach a buffer sized to it, and commit. Also requests a frame
+    /// callback and presentation feedback for the committed frame: a presented feedback proves
+    /// the compositor actually rendered the lock surface (feedbacks are only presented from
+    /// the render path).
+    pub fn ack_and_commit_with_feedback(&self) {
+        let (serial, w, h) = self.configure.unwrap();
+        self.viewport.set_destination(w as i32, h as i32);
+        let buffer = self.spbm.create_u32_rgba_buffer(0, 0, 0, 0, &self.qh, ());
+        self.surface.attach(Some(&buffer), 0, 0);
+        self.surface.frame(&self.qh, self.surface.clone());
+        if let Some(presentation) = &self.presentation {
+            presentation.feedback(&self.surface, &self.qh, self.surface.clone());
+        }
+        self.lock_surface.ack_configure(serial);
+        self.surface.commit();
     }
 }
 
@@ -969,6 +1062,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WpPresentation::interface().name {
                     let version = min(version, WpPresentation::interface().version);
                     state.presentation = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ExtSessionLockManagerV1::interface().name {
+                    let version = min(version, ExtSessionLockManagerV1::interface().version);
+                    state.session_lock_manager = Some(registry.bind(name, version, qh, ()));
                 }
 
                 let global = Global {
@@ -1538,6 +1634,8 @@ impl Dispatch<WlCallback, WlSurface> for State {
             wl_callback::Event::Done { .. } => {
                 if let Some(window) = state.windows.iter_mut().find(|w| w.surface == *surface) {
                     window.frame_callbacks += 1;
+                } else if let Some(lock) = state.locks.iter_mut().find(|l| l.surface == *surface) {
+                    lock.frame_callbacks += 1;
                 }
             }
             _ => unreachable!(),
@@ -1561,6 +1659,8 @@ impl Dispatch<WpPresentation, ()> for State {
     }
 }
 
+wayland_client::delegate_noop!(State: ExtSessionLockManagerV1);
+
 /// Presentation feedback for a window or lock surface (data: the surface it was requested for).
 impl Dispatch<WpPresentationFeedback, WlSurface> for State {
     fn event(
@@ -1579,12 +1679,55 @@ impl Dispatch<WpPresentationFeedback, WlSurface> for State {
                     if let Some(start) = window.pres_start {
                         window.presented_at.push(start.elapsed());
                     }
+                } else if let Some(lock) = state.locks.iter_mut().find(|l| l.surface == *surface) {
+                    lock.presented += 1;
                 }
             }
             wp_presentation_feedback::Event::Discarded => {
                 if let Some(window) = state.windows.iter_mut().find(|w| w.surface == *surface) {
                     window.feedback_discarded += 1;
+                } else if let Some(lock) = state.locks.iter_mut().find(|l| l.surface == *surface) {
+                    lock.feedback_discarded += 1;
                 }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<ExtSessionLockV1, LockFlags> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtSessionLockV1,
+        event: <ExtSessionLockV1 as wayland_client::Proxy>::Event,
+        flags: &LockFlags,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_v1::Event::Finished => flags.finished.store(true, Ordering::Relaxed),
+            ext_session_lock_v1::Event::Locked => flags.locked.store(true, Ordering::Relaxed),
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<ExtSessionLockSurfaceV1, usize> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtSessionLockSurfaceV1,
+        event: <ExtSessionLockSurfaceV1 as wayland_client::Proxy>::Event,
+        index: &usize,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_session_lock_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                state.locks[*index].configure = Some((serial, width, height));
             }
             _ => unreachable!(),
         }
