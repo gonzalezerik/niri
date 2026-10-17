@@ -11,6 +11,7 @@ pub mod gnome_shell_introspect;
 pub mod gnome_shell_screenshot;
 pub mod mutter_display_config;
 pub mod mutter_service_channel;
+#[cfg(feature = "auto-rotate")]
 pub mod net_hadess_sensorproxy;
 
 #[cfg(feature = "xdp-gnome-screencast")]
@@ -39,6 +40,7 @@ pub struct DBusServers {
     pub conn_screen_cast: Option<Connection>,
     pub conn_login1: Option<Connection>,
     pub conn_locale1: Option<Connection>,
+    #[cfg(feature = "auto-rotate")]
     pub conn_sensorproxy: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
 }
@@ -172,19 +174,22 @@ impl DBusServers {
             }
         }
 
-        let (to_niri, from_sensorproxy) = calloop::channel::channel();
-        niri.event_loop
-            .insert_source(from_sensorproxy, move |event, _, state| match event {
-                calloop::channel::Event::Msg(msg) => state.on_sensorproxy_msg(msg),
-                calloop::channel::Event::Closed => (),
-            })
-            .unwrap();
-        match net_hadess_sensorproxy::start(to_niri) {
-            Ok(conn) => {
-                dbus.conn_sensorproxy = Some(conn);
-            }
-            Err(err) => {
-                warn!("error starting net_heades_sensorproxy watcher: {err:?}");
+        #[cfg(feature = "auto-rotate")]
+        {
+            let (to_niri, from_sensorproxy) = calloop::channel::channel();
+            niri.event_loop
+                .insert_source(from_sensorproxy, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_sensorproxy_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            match net_hadess_sensorproxy::start(to_niri) {
+                Ok(conn) => {
+                    dbus.conn_sensorproxy = Some(conn);
+                }
+                Err(err) => {
+                    warn!("error starting net_heades_sensorproxy watcher: {err:?}");
+                }
             }
         }
 

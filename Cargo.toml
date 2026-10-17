@@ -143,6 +143,9 @@ profile-with-tracy-ondemand = ["profile-with-tracy", "tracy-client/ondemand", "t
 profile-with-tracy-allocations = ["profile-with-tracy"]
 # Enables dinit integration (global environment).
 dinit = []
+# Enables `auto-rotate` in output configs: rotates those outputs to follow the
+# accelerometer through iio-sensor-proxy (net.hadess.SensorProxy on D-Bus).
+auto-rotate = ["dbus"]
 
 [lints.clippy]
 new_without_default = "allow"
