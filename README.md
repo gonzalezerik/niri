@@ -1,5 +1,7 @@
 # niri, HDR branch (`erikg-hdr`)
 
+> **Built with LLM assistance.** The features and fixes I add in this fork are written with the help of large language models, specifically Qwen 3.8 Flash-Next. niri doesn't accept LLM-assisted contributions, so I will never submit them to [niri-wm/niri](https://github.com/niri-wm/niri); they stay in this fork. dividebysandwich's HDR work and the commits picked in from niri pull requests are their authors' own.
+
 This is my personal build of [niri](https://github.com/niri-wm/niri), the scrollable-tiling Wayland compositor. I run it on my ASUS ProArt PX13 laptop (AMD Radeon 8060S) and my desktop (NVIDIA RTX 5070 Ti). It is not an official niri release and is not affiliated with the niri project.
 
 ## Where it comes from
