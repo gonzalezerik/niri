@@ -25,7 +25,9 @@ Upstream niri doesn't support HDR yet; that depends on color management landing 
 
 **Per-output color profiles** (only in this branch): color correction from an ICC profile or the display's EDID, applied in the GPU's display pipeline, similar to KDE Plasma's "Color profile" setting. See [Configuration: Color Profiles](docs/wiki/Configuration:-Color-Profiles.md).
 
-**Auto-rotate** (only in this branch): rotates an output from the accelerometer through iio-sensor-proxy, for 2-in-1 laptops like the PX13. Carried from [niri-wm/niri#3763](https://github.com/niri-wm/niri/pull/3763) by Rio Sanjaya ([@oisanjaya](https://github.com/oisanjaya)), squashed into one commit; all credit to them.
+**Auto-rotate** (only in this branch): rotates an output from the accelerometer through iio-sensor-proxy, for 2-in-1 laptops like the PX13. Carried from [niri-wm/niri#3763](https://github.com/niri-wm/niri/pull/3763) by Rio Sanjaya ([@oisanjaya](https://github.com/oisanjaya)), squashed into one commit; all credit to them. It is an opt-in build feature, so desktops don't run the accelerometer watcher: build with `cargo build --release --features auto-rotate`.
+
+**Float above fullscreen** (until upstream merges it): the `float-above-fullscreen` window rule keeps a floating window visible over a focused fullscreen window, e.g. a picture-in-picture video over a game. Carried from [niri-wm/niri#4062](https://github.com/niri-wm/niri/pull/4062) by Zhai Can ([@bczhc](https://github.com/bczhc)), with the original commits.
 
 ## Using it
 
@@ -34,7 +36,7 @@ Build it the same way as upstream niri. Smithay comes from [dividebysandwich/smi
 ```kdl
 output "eDP-1" {
     hdr mode="auto"   // HDR while a fullscreen app shows HDR content
-    auto-rotate       // follow the accelerometer (needs iio-sensor-proxy)
+    auto-rotate       // follow the accelerometer (needs --features auto-rotate and iio-sensor-proxy)
 }
 
 color-profile "eDP-1" {
