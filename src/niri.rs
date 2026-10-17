@@ -867,13 +867,12 @@ impl State {
                 continue;
             }
 
-            match self.backend.create_virtual_output(
-                &mut self.niri,
-                1920,
-                1080,
-                60,
-                Some(name.clone()),
-            ) {
+            // Pass no explicit mode: the config section's own mode (if any) takes precedence
+            // inside `VirtualOutputs::create`.
+            match self
+                .backend
+                .create_virtual_output(&mut self.niri, None, Some(name.clone()))
+            {
                 Ok(created) => {
                     info!("created virtual output from config: {created}");
                 }

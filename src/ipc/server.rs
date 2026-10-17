@@ -17,8 +17,8 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Timestamp, WindowLayout, Workspace,
+    Action, Event, KeyboardLayouts, OutputAction, OutputConfigChanged, Overview, Reply, Request,
+    Response, ScaleToSet, Timestamp, WindowLayout, Workspace,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -419,26 +419,35 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
 
             Response::OutputConfigChanged(response)
         }
-        Request::CreateVirtualOutput {
-            width,
-            height,
-            refresh_rate,
-            name,
-        } => {
-            let width = width.unwrap_or(1920);
-            let height = height.unwrap_or(1080);
-            let refresh_rate = refresh_rate.unwrap_or(60);
+        Request::CreateVirtualOutput { name, mode, scale } => {
+            if let Some(scale) = scale {
+                if !scale.is_finite() || scale <= 0.0 || scale > 10.0 {
+                    return Err("scale must be greater than 0 and at most 10".to_string());
+                }
+            }
 
             let (tx, rx) = async_channel::bounded(1);
 
             ctx.event_loop.insert_idle(move |state| {
-                let result = state.backend.create_virtual_output(
-                    &mut state.niri,
-                    width,
-                    height,
-                    refresh_rate,
-                    name,
-                );
+                let result = state
+                    .backend
+                    .create_virtual_output(&mut state.niri, mode, name);
+                if let Ok(name) = &result {
+                    // Record an explicitly requested mode/scale in the transient output config,
+                    // so it survives config reloads the same way `niri msg output` changes do.
+                    if let Some(mode) = mode {
+                        state
+                            .apply_transient_output_config(name, OutputAction::CustomMode { mode });
+                    }
+                    if let Some(scale) = scale {
+                        state.apply_transient_output_config(
+                            name,
+                            OutputAction::Scale {
+                                scale: ScaleToSet::Specific(scale),
+                            },
+                        );
+                    }
+                }
                 let _ = tx.send_blocking(result);
             });
 

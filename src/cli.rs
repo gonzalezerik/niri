@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use niri_ipc::{Action, OutputAction};
+use niri_ipc::{Action, ConfiguredMode, OutputAction};
 
 use crate::utils::version;
 
@@ -103,21 +103,23 @@ pub enum Msg {
         action: OutputAction,
     },
     /// Create a virtual output.
+    ///
+    /// If an output with the given name already exists and is virtual, it is resized in place
+    /// instead of creating a new one.
     CreateVirtualOutput {
         /// Optional name for the created output.
         ///
         /// When omitted, a unique `HEADLESS-N` name is generated.
         #[arg(long)]
         name: Option<String>,
-        /// Width in pixels.
-        #[arg(long, default_value = "1920")]
-        width: u16,
-        /// Height in pixels.
-        #[arg(long, default_value = "1080")]
-        height: u16,
-        /// Refresh rate in Hz.
-        #[arg(long, default_value = "60")]
-        refresh_rate: u32,
+        /// Mode as `WIDTHxHEIGHT[@REFRESH]`, e.g. `2560x1440@144`.
+        ///
+        /// Defaults to `1920x1080@60`.
+        #[arg(long)]
+        mode: Option<ConfiguredMode>,
+        /// Scale factor. Defaults to 1.
+        #[arg(long)]
+        scale: Option<f64>,
     },
     /// Remove a virtual output.
     RemoveVirtualOutput {

@@ -41,16 +41,10 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
             output: output.clone(),
             action: action.clone(),
         },
-        Msg::CreateVirtualOutput {
-            name,
-            width,
-            height,
-            refresh_rate,
-        } => Request::CreateVirtualOutput {
+        Msg::CreateVirtualOutput { name, mode, scale } => Request::CreateVirtualOutput {
             name: name.clone(),
-            width: Some(*width),
-            height: Some(*height),
-            refresh_rate: Some(*refresh_rate),
+            mode: *mode,
+            scale: *scale,
         },
         Msg::RemoveVirtualOutput { name } => Request::RemoveVirtualOutput { name: name.clone() },
         Msg::Workspaces => Request::Workspaces,

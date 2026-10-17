@@ -3021,21 +3021,12 @@ impl Tty {
     pub fn create_virtual_output(
         &mut self,
         niri: &mut Niri,
-        width: u16,
-        height: u16,
-        refresh_rate: u32,
+        mode: Option<niri_ipc::ConfiguredMode>,
         name: Option<String>,
     ) -> Result<String, String> {
-        let refresh_millihz = refresh_rate.saturating_mul(1000);
-
-        let name = self.virtual_outputs.create(
-            niri,
-            &self.ipc_outputs,
-            width,
-            height,
-            refresh_millihz,
-            name,
-        )?;
+        let name = self
+            .virtual_outputs
+            .create(niri, &self.ipc_outputs, mode, name)?;
 
         // Ensure IPC reflects the configured mode immediately.
         self.refresh_ipc_outputs(niri);

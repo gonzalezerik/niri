@@ -279,20 +279,18 @@ impl Backend {
     }
 
     /// Create a new virtual output and return its name.
-    /// Only supported on TTY and Headless backends.
+    ///
+    /// If `name` names an existing virtual output, it is resized in place (when `mode` is `Some`)
+    /// instead of being created again. Only supported on TTY and Headless backends.
     pub fn create_virtual_output(
         &mut self,
         niri: &mut Niri,
-        width: u16,
-        height: u16,
-        refresh_rate: u32,
+        mode: Option<niri_ipc::ConfiguredMode>,
         name: Option<String>,
     ) -> Result<String, String> {
         match self {
-            Backend::Headless(headless) => {
-                headless.create_virtual_output(niri, width, height, refresh_rate, name)
-            }
-            Backend::Tty(tty) => tty.create_virtual_output(niri, width, height, refresh_rate, name),
+            Backend::Headless(headless) => headless.create_virtual_output(niri, mode, name),
+            Backend::Tty(tty) => tty.create_virtual_output(niri, mode, name),
             Backend::Winit(_) => {
                 Err("virtual outputs are not supported on the Winit backend".to_string())
             }

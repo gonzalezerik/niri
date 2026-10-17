@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use niri_config::{Config, OutputName};
+use niri_ipc::ConfiguredMode;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::utils::Size;
 
@@ -22,6 +23,11 @@ const MAX_VIRTUAL_DIM: u16 = 16384;
 
 /// Largest allowed virtual output refresh rate, in hertz.
 const MAX_VIRTUAL_REFRESH_HZ: u32 = 1000;
+
+/// Default mode for virtual outputs created without an explicit mode.
+const DEFAULT_VIRTUAL_WIDTH: u16 = 1920;
+const DEFAULT_VIRTUAL_HEIGHT: u16 = 1080;
+const DEFAULT_VIRTUAL_REFRESH_HZ: f64 = 60.0;
 
 /// Validates a virtual output mode.
 ///
@@ -220,27 +226,57 @@ impl VirtualOutputs {
         self.outputs.iter()
     }
 
-    /// Create a virtual output and add it to the compositor.
+    /// Create a virtual output, or resize an existing one in place.
     ///
-    /// If `name` matches an existing output config, the configured mode and `off` state take
-    /// precedence over the requested `width`/`height`/`refresh_millihz`. Returns the name of the
-    /// created output.
+    /// If `name` names an already-managed virtual output, it is *not* created again: when `mode`
+    /// is `Some`, the output's mode is changed in place (preferred over destroy-and-recreate),
+    /// otherwise the call is a no-op. Either way the name is returned.
+    ///
+    /// When creating, if `name` matches an existing output config, the configured mode and `off`
+    /// state take precedence over the requested mode. Returns the name of the created/resized
+    /// output.
     pub fn create(
         &mut self,
         niri: &mut Niri,
         ipc_outputs: &Arc<Mutex<IpcOutputMap>>,
-        width: u16,
-        height: u16,
-        refresh_millihz: u32,
+        mode: Option<ConfiguredMode>,
         name: Option<String>,
     ) -> Result<String, String> {
-        let mut width = width;
-        let mut height = height;
-        let mut refresh_millihz = refresh_millihz;
+        let (mut width, mut height, mut refresh_millihz) = match mode {
+            Some(mode) => {
+                let refresh_hz = mode.refresh.unwrap_or(DEFAULT_VIRTUAL_REFRESH_HZ);
+                if !refresh_hz.is_finite() || refresh_hz <= 0.0 {
+                    return Err(format!(
+                        "refresh rate must be greater than 0 and at most {MAX_VIRTUAL_REFRESH_HZ} Hz"
+                    ));
+                }
+                let refresh_millihz =
+                    (refresh_hz * 1000.0).round().clamp(1.0, u32::MAX as f64) as u32;
+                (mode.width, mode.height, refresh_millihz)
+            }
+            None => (
+                DEFAULT_VIRTUAL_WIDTH,
+                DEFAULT_VIRTUAL_HEIGHT,
+                (DEFAULT_VIRTUAL_REFRESH_HZ * 1000.0) as u32,
+            ),
+        };
         let mut should_connect = true;
 
         if let Some(name) = name.as_deref() {
             validate_virtual_name(name)?;
+
+            // Resize an existing virtual output in place instead of creating a new one.
+            if self.outputs.contains_key(name) {
+                if mode.is_some() {
+                    validate_virtual_mode(width, height, refresh_millihz)?;
+                    let mode = Mode {
+                        size: Size::from((i32::from(width), i32::from(height))),
+                        refresh: refresh_millihz.clamp(1, i32::MAX as u32) as i32,
+                    };
+                    self.set_mode(niri, ipc_outputs, name, mode)?;
+                }
+                return Ok(name.to_owned());
+            }
 
             let lookup_name = OutputName {
                 connector: name.to_string(),
@@ -256,15 +292,16 @@ impl VirtualOutputs {
                     width = mode_config.mode.width;
                     height = mode_config.mode.height;
 
-                    let refresh_hz = mode_config.mode.refresh.unwrap_or(60.0);
+                    let refresh_hz = mode_config
+                        .mode
+                        .refresh
+                        .unwrap_or(DEFAULT_VIRTUAL_REFRESH_HZ);
                     refresh_millihz =
                         (refresh_hz * 1000.0).round().clamp(1.0, u32::MAX as f64) as u32;
                 }
             }
 
-            if self.outputs.contains_key(name)
-                || niri.global_space.outputs().any(|o| o.name() == name)
-            {
+            if niri.global_space.outputs().any(|o| o.name() == name) {
                 return Err(format!("output '{name}' already exists"));
             }
         }
@@ -292,6 +329,53 @@ impl VirtualOutputs {
         }
 
         Ok(built.name)
+    }
+
+    /// Change the mode of a managed virtual output in place, updating IPC state and the frame
+    /// clock, and resizing/redrawing if it is connected.
+    fn set_mode(
+        &mut self,
+        niri: &mut Niri,
+        ipc_outputs: &Arc<Mutex<IpcOutputMap>>,
+        name: &str,
+        mode: Mode,
+    ) -> Result<(), String> {
+        let (output, output_id) = self
+            .outputs
+            .get(name)
+            .ok_or_else(|| format!("virtual output '{name}' not found"))?;
+
+        if output.current_mode() == Some(mode) {
+            return Ok(());
+        }
+
+        set_virtual_output_mode_single(output, mode);
+
+        {
+            let mut guard = ipc_outputs.lock().unwrap();
+            if let Some(ipc_output) = guard.get_mut(output_id) {
+                ipc_output.modes = vec![niri_ipc::Mode {
+                    width: mode.size.w as u16,
+                    height: mode.size.h as u16,
+                    refresh_rate: mode.refresh as u32,
+                    is_preferred: true,
+                }];
+                ipc_output.current_mode = Some(0);
+                ipc_output.is_custom_mode = true;
+            }
+        }
+
+        niri.ipc_outputs_changed = true;
+
+        // If connected, keep the frame clock in sync and resize.
+        if let Some(output_state) = niri.output_state.get_mut(output) {
+            let refresh_interval = refresh_interval_from_millihz(mode.refresh.max(1) as u64);
+            output_state.frame_clock = FrameClock::new(Some(refresh_interval), false);
+            niri.output_resized(output);
+            niri.queue_redraw(output);
+        }
+
+        Ok(())
     }
 
     /// Remove the virtual output with the given name.

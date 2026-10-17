@@ -162,7 +162,7 @@ impl Headless {
         // on. In tests, the harness explicitly creates predictable `headless-N` outputs; creating
         // an extra default `HEADLESS-1` here causes name collisions and snapshot churn.
         if self.virtual_outputs.iter().next().is_none() && !cfg!(test) {
-            let _ = self.create_virtual_output(niri, 1920, 1080, 60, None);
+            let _ = self.create_virtual_output(niri, None, None);
         }
     }
 
@@ -286,25 +286,16 @@ impl Headless {
     }
 
     /// Create a virtual output with the given mode and add it to the compositor.
-    /// Returns the name of the created output.
+    /// Returns the name of the created (or resized) output.
     pub fn create_virtual_output(
         &mut self,
         niri: &mut Niri,
-        width: u16,
-        height: u16,
-        refresh_rate: u32,
+        mode: Option<niri_ipc::ConfiguredMode>,
         name: Option<String>,
     ) -> Result<String, String> {
-        let refresh_millihz = refresh_rate.saturating_mul(1000);
-
-        let name = self.virtual_outputs.create(
-            niri,
-            &self.ipc_outputs,
-            width,
-            height,
-            refresh_millihz,
-            name,
-        )?;
+        let name = self
+            .virtual_outputs
+            .create(niri, &self.ipc_outputs, mode, name)?;
 
         // Ensure IPC state matches the (potentially) configured mode and connection state.
         niri.ipc_outputs_changed = true;

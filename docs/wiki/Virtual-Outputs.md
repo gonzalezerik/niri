@@ -19,11 +19,15 @@ When running niri on a TTY with your physical monitor, you can create additional
 # Create a 1920x1080@144 virtual output named "sunshine"
 niri msg create-virtual-output \
   --name sunshine \
-  --width 1920 \
-  --height 1080 \
-  --refresh-rate 144
+  --mode 1920x1080@144
+
+# Optionally set a scale factor:
+niri msg create-virtual-output --name sunshine --mode 1920x1080@144 --scale 1.25
 
 # If --name is omitted, a unique HEADLESS-N name is generated.
+# If --mode is omitted, the default is 1920x1080@60.
+# If an output with the given name already exists and is virtual, it is resized in place
+# instead of creating a new one.
 ```
 
 If you want to see what exists:
@@ -101,7 +105,7 @@ The snippets below are intentionally minimal; adjust them to your Sunshine setup
       "output": "sunshine",
       "prep-cmd": [
         {
-          "do": "sh -c \"niri msg create-virtual-output --name sunshine --width ${SUNSHINE_CLIENT_WIDTH} --height ${SUNSHINE_CLIENT_HEIGHT} --refresh-rate ${SUNSHINE_CLIENT_FPS}\"",
+          "do": "sh -c \"niri msg create-virtual-output --name sunshine --mode ${SUNSHINE_CLIENT_WIDTH}x${SUNSHINE_CLIENT_HEIGHT}@${SUNSHINE_CLIENT_FPS}\"",
           "undo": "niri msg remove-virtual-output sunshine"
         }
       ]
@@ -161,7 +165,7 @@ injects input over Wayland (like wayvnc), niri doesn’t need access to `/dev/in
 niri --session &
 
 # 2. Create a virtual output for VNC
-niri msg create-virtual-output --width 1920 --height 1080
+niri msg create-virtual-output --mode 1920x1080
 
 # 3. Start wayvnc on the virtual output
 wayvnc --output HEADLESS-1

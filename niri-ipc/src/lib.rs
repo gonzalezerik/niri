@@ -99,18 +99,18 @@ pub enum Request {
         action: OutputAction,
     },
     /// Create a new virtual headless output.
-    /// Defaults to 1920x1080 @ 60 Hz when not specified.
+    ///
+    /// If an output with `name` already exists and is a virtual output, it is resized in place
+    /// rather than creating a new one.
     CreateVirtualOutput {
-        /// Width in pixels.
-        width: Option<u16>,
-        /// Height in pixels.
-        height: Option<u16>,
-        /// Refresh rate in Hz.
-        refresh_rate: Option<u32>,
         /// Optional output name to use instead of auto-generated `HEADLESS-N`.
         ///
         /// When omitted, the compositor will pick a unique name.
         name: Option<String>,
+        /// Mode as `WIDTHxHEIGHT[@REFRESH]`. Defaults to 1920x1080 @ 60 Hz when not specified.
+        mode: Option<ConfiguredMode>,
+        /// Scale factor. Defaults to 1.
+        scale: Option<f64>,
     },
     /// Remove a virtual headless output by name.
     RemoveVirtualOutput {
