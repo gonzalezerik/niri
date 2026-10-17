@@ -485,15 +485,32 @@ impl Default for Headless {
 }
 
 /// Create an EGL display on the DRM render node at `path` using EGL_EXT_platform_device.
+///
+/// The same render node can be enumerated by more than one EGL vendor (e.g. Mesa
+/// also lists an NVIDIA node, but fails to initialize it). Try every matching
+/// device and keep the first display that initializes.
 unsafe fn egl_display_for_render_node(path: &Path) -> anyhow::Result<EGLDisplay> {
     let node =
         DrmNode::from_path(path).with_context(|| format!("error opening {path:?} as DRM node"))?;
 
-    let device = EGLDevice::enumerate()?
-        .find(|device| device.try_get_render_node().ok().flatten() == Some(node))
-        .with_context(|| format!("no EGL device found for render node {node}"))?;
+    let candidates: Vec<_> = EGLDevice::enumerate()?
+        .filter(|device| device.try_get_render_node().ok().flatten() == Some(node))
+        .collect();
 
-    EGLDisplay::new(device).with_context(|| format!("error creating EGL display for {node}"))
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "no EGL device found for render node {node}"
+    );
+
+    let mut last_err = None;
+    for device in candidates {
+        match EGLDisplay::new(device) {
+            Ok(display) => return Ok(display),
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err.unwrap()).with_context(|| format!("error creating EGL display for {node}"))
 }
 
 #[cfg(feature = "xdp-gnome-screencast")]
