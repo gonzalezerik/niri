@@ -649,6 +649,183 @@ fn virtual_output_scale_affects_logical_geometry_and_mapping() {
     assert!(inside(geom, point));
 }
 
+/// Insert a fast timer that pumps the server event loop, so the virtual output's synthetic
+/// vblank timers fire while the test's pump loop runs.
+fn pump_server_every_ms(f: &mut Fixture, ms: u64) {
+    use calloop::timer::{TimeoutAction, Timer};
+
+    let interval = std::time::Duration::from_millis(ms);
+    f.handle
+        .insert_source(Timer::from_duration(interval), move |_, _, state| {
+            state.server.dispatch();
+            TimeoutAction::ToDuration(interval)
+        })
+        .unwrap();
+}
+
+/// Pump the fixture (server) and client loops for `duration`, making the window (if given)
+/// commit a new frame with a fresh frame callback + presentation feedback on every frame
+/// callback, like a screen-capture client does.
+fn pump_presentation_loops(
+    f: &mut Fixture,
+    id: client::ClientId,
+    window_surface: Option<wayland_client::protocol::wl_surface::WlSurface>,
+    duration: std::time::Duration,
+) -> std::time::Duration {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < duration {
+        f.dispatch();
+        let client = f.client(id);
+        client.dispatch();
+        if let Some(surface) = &window_surface {
+            client.window(surface).pump_presentation_loop();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    t0.elapsed()
+}
+
+/// A fixture with a single virtual output at `mode` and one client window on it, running a
+/// commit-on-every-frame-callback loop with presentation feedbacks.
+fn presentation_fixture(
+    mode: niri_ipc::ConfiguredMode,
+) -> (
+    Fixture,
+    client::ClientId,
+    wayland_client::protocol::wl_surface::WlSurface,
+) {
+    let mut f = Fixture::new();
+
+    let _name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(&mut state.niri, Some(mode), Some("virt".to_owned()))
+            .unwrap()
+    };
+
+    pump_server_every_ms(&mut f, 1);
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.start_presentation_loop();
+
+    (f, id, surface)
+}
+
+fn presented_count(
+    f: &Fixture,
+    id: client::ClientId,
+    surface: &wayland_client::protocol::wl_surface::WlSurface,
+) -> usize {
+    f.state
+        .clients
+        .iter()
+        .find(|c| c.id == id)
+        .unwrap()
+        .state
+        .windows
+        .iter()
+        .find(|w| w.surface == *surface)
+        .unwrap()
+        .presented
+}
+
+/// The presentation-feedback path must deliver `wp_presentation_feedback.presented` events at
+/// the output's mode rate: a client that commits on every frame callback and requests feedback
+/// each frame (what a screen-capture client does) gets one presented event per rendered frame.
+#[test]
+fn virtual_output_presentation_feedback_paces_at_mode_rate() {
+    let (mut f, id, surface) = presentation_fixture(niri_ipc::ConfiguredMode {
+        width: 800,
+        height: 600,
+        refresh: Some(100.0),
+    });
+
+    let elapsed = pump_presentation_loops(
+        &mut f,
+        id,
+        Some(surface.clone()),
+        std::time::Duration::from_millis(1000),
+    );
+    let presented = presented_count(&f, id, &surface);
+
+    let expected = elapsed.as_secs_f64() * 100.0;
+    // Loose bounds for CI: the feedback rate tracks the mode rate, never exceeds it, and is
+    // nowhere near zero (which is what a broken feedback path looks like: the client stalls
+    // waiting for frame callbacks and presents grind to a halt).
+    assert!(
+        presented as f64 >= expected * 0.6 && presented as f64 <= expected * 1.3,
+        "{presented} presented events in {elapsed:?}; expected ~{expected:.0} at 100 Hz",
+    );
+}
+
+/// The 4 s @ 2560x1440@120 measurement for the report: prints presented count and the
+/// presented-to-presented interval. Run with:
+/// `cargo test --release virtual_output_presentation_feedback_2560x1440_at_120hz -- --ignored
+/// --nocapture`
+#[test]
+#[ignore = "4 s measurement at 2560x1440@120; run with --ignored --nocapture"]
+fn virtual_output_presentation_feedback_2560x1440_at_120hz() {
+    let (mut f, id, surface) = presentation_fixture(niri_ipc::ConfiguredMode {
+        width: 2560,
+        height: 1440,
+        refresh: Some(120.0),
+    });
+
+    let elapsed = pump_presentation_loops(
+        &mut f,
+        id,
+        Some(surface.clone()),
+        std::time::Duration::from_secs(4),
+    );
+
+    let window = f
+        .state
+        .client(id)
+        .state
+        .windows
+        .iter()
+        .find(|w| w.surface == surface)
+        .unwrap();
+    let presented = window.presented;
+    let discarded = window.feedback_discarded;
+    let stamps = &window.presented_at;
+
+    println!("elapsed: {elapsed:?}");
+    println!("presented: {presented}, discarded: {discarded}");
+    println!(
+        "rate: {:.1} Hz (expected ~480 in 4 s at 120 Hz)",
+        presented as f64 / elapsed.as_secs_f64()
+    );
+    if stamps.len() >= 2 {
+        let mut diffs: Vec<f64> = stamps
+            .windows(2)
+            .map(|w| (w[1] - w[0]).as_secs_f64() * 1000.0)
+            .collect();
+        diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean: f64 = diffs.iter().sum::<f64>() / diffs.len() as f64;
+        println!(
+            "p2p interval: mean {mean:.2} ms, median {:.2} ms, p10 {:.2} ms, p90 {:.2} ms (expected ~8.33 ms)",
+            diffs[diffs.len() / 2],
+            diffs[diffs.len() / 10],
+            diffs[diffs.len() * 9 / 10],
+        );
+    }
+
+    assert!(presented > 0, "no presented events");
+}
+
 #[test]
 fn tablet_map_to_output_targets_virtual_output() {
     let mut f = Fixture::new();

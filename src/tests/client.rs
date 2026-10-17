@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
@@ -21,6 +21,12 @@ use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1;
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_info_v1::{self, WpImageDescriptionInfoV1};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_v1::{self, WpImageDescriptionV1};
+use smithay::reexports::wayland_protocols::wp::presentation_time::client::wp_presentation::{
+    self as wp_presentation, WpPresentation,
+};
+use smithay::reexports::wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::{
+    self as wp_presentation_feedback, WpPresentationFeedback,
+};
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
@@ -98,6 +104,7 @@ pub struct State {
     pub color_management_surfaces: Vec<(WlSurface, WpColorManagementSurfaceV1)>,
     /// Count of image_description_changed events received on output objects.
     pub output_image_description_changed: usize,
+    pub presentation: Option<WpPresentation>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -116,6 +123,14 @@ pub struct Window {
     pub close_requested: bool,
 
     pub configures_looked_at: usize,
+
+    pub presentation: Option<WpPresentation>,
+    pub frame_callbacks: usize,
+    pub frame_callbacks_looked_at: usize,
+    pub presented: usize,
+    pub feedback_discarded: usize,
+    pub presented_at: Vec<Duration>,
+    pub pres_start: Option<Instant>,
 }
 
 pub struct LayerSurface {
@@ -310,6 +325,7 @@ impl Client {
             color_management_outputs: Vec::new(),
             color_management_surfaces: Vec::new(),
             output_image_description_changed: 0,
+            presentation: None,
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -617,6 +633,14 @@ impl State {
             close_requested: false,
 
             configures_looked_at: 0,
+
+            presentation: self.presentation.clone(),
+            frame_callbacks: 0,
+            frame_callbacks_looked_at: 0,
+            presented: 0,
+            feedback_discarded: 0,
+            presented_at: Vec::new(),
+            pres_start: None,
         };
 
         self.windows.push(window);
@@ -687,6 +711,35 @@ impl State {
 impl Window {
     pub fn commit(&self) {
         self.surface.commit();
+    }
+
+    /// Request a frame callback and a presentation feedback for the next commit.
+    pub fn request_frame_and_feedback(&self) {
+        self.surface.frame(&self.qh, self.surface.clone());
+        if let Some(presentation) = &self.presentation {
+            presentation.feedback(&self.surface, &self.qh, self.surface.clone());
+        }
+    }
+
+    /// Start a commit-on-every-frame-callback loop with presentation feedback.
+    pub fn start_presentation_loop(&mut self) {
+        self.pres_start = Some(Instant::now());
+        self.attach_new_buffer();
+        self.request_frame_and_feedback();
+        self.commit();
+    }
+
+    /// If a frame callback arrived since the last look, commit a new frame with a fresh frame
+    /// callback and presentation feedback. Returns whether a frame was committed.
+    pub fn pump_presentation_loop(&mut self) -> bool {
+        if self.frame_callbacks_looked_at == self.frame_callbacks {
+            return false;
+        }
+        self.frame_callbacks_looked_at = self.frame_callbacks;
+        self.attach_new_buffer();
+        self.request_frame_and_feedback();
+        self.commit();
+        true
     }
 
     pub fn ack_last(&self) {
@@ -913,6 +966,9 @@ impl Dispatch<WlRegistry, ()> for State {
                         ZwpKeyboardShortcutsInhibitManagerV1::interface().version,
                     );
                     state.ksim = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WpPresentation::interface().name {
+                    let version = min(version, WpPresentation::interface().version);
+                    state.presentation = Some(registry.bind(name, version, qh, ()));
                 }
 
                 let global = Global {
@@ -1465,5 +1521,72 @@ impl Dispatch<WpColorManagementSurfaceV1, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         // No events.
+    }
+}
+
+/// Frame callback for a window or lock surface (data: the surface it was requested for).
+impl Dispatch<WlCallback, WlSurface> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlCallback,
+        event: <WlCallback as wayland_client::Proxy>::Event,
+        surface: &WlSurface,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_callback::Event::Done { .. } => {
+                if let Some(window) = state.windows.iter_mut().find(|w| w.surface == *surface) {
+                    window.frame_callbacks += 1;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WpPresentation, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpPresentation,
+        event: <WpPresentation as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_presentation::Event::ClockId { .. } => (),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Presentation feedback for a window or lock surface (data: the surface it was requested for).
+impl Dispatch<WpPresentationFeedback, WlSurface> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpPresentationFeedback,
+        event: <WpPresentationFeedback as wayland_client::Proxy>::Event,
+        surface: &WlSurface,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_presentation_feedback::Event::SyncOutput { .. } => (),
+            wp_presentation_feedback::Event::Presented { .. } => {
+                if let Some(window) = state.windows.iter_mut().find(|w| w.surface == *surface) {
+                    window.presented += 1;
+                    if let Some(start) = window.pres_start {
+                        window.presented_at.push(start.elapsed());
+                    }
+                }
+            }
+            wp_presentation_feedback::Event::Discarded => {
+                if let Some(window) = state.windows.iter_mut().find(|w| w.surface == *surface) {
+                    window.feedback_discarded += 1;
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 }
