@@ -137,7 +137,7 @@ use crate::dbus::freedesktop_login1::Login1ToNiri;
 use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospect};
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
-#[cfg(feature = "dbus")]
+#[cfg(feature = "auto-rotate")]
 use crate::dbus::net_hadess_sensorproxy::SensorProxyToNiri;
 use crate::frame_clock::FrameClock;
 use crate::handlers::image_copy_capture::{
@@ -468,7 +468,7 @@ pub struct Niri {
     pub inhibit_power_key_fd: Option<zbus::zvariant::OwnedFd>,
 
     //iio-sensor-proxy state.
-    #[cfg(feature = "dbus")]
+    #[cfg(feature = "auto-rotate")]
     pub accelerometer_orientation: Option<String>,
 
     pub ipc_server: Option<IpcServer>,
@@ -853,7 +853,7 @@ impl State {
     }
 
     // set accelerometer orientation from iio-sensor-proxy
-    #[cfg(feature = "dbus")]
+    #[cfg(feature = "auto-rotate")]
     pub fn set_accelerometer_orientation(&mut self, value: String) {
         self.niri.accelerometer_orientation = Some(value.clone());
 
@@ -2499,7 +2499,7 @@ impl State {
         }
     }
 
-    #[cfg(feature = "dbus")]
+    #[cfg(feature = "auto-rotate")]
     pub fn on_sensorproxy_msg(&mut self, msg: SensorProxyToNiri) {
         let SensorProxyToNiri::SensorProxyChanged(orientation) = msg;
 
@@ -2816,6 +2816,11 @@ impl Niri {
         let display_handle = display.handle();
         let config_ = config.borrow();
         let config_file_output_config = config_.outputs.clone();
+
+        #[cfg(not(feature = "auto-rotate"))]
+        if config_.outputs.0.iter().any(|output| output.auto_rotate) {
+            warn!("auto-rotate is set on an output, but niri was built without the auto-rotate feature");
+        }
 
         let mut animation_clock = Clock::default();
 
@@ -3256,7 +3261,7 @@ impl Niri {
             a11y,
             #[cfg(feature = "dbus")]
             inhibit_power_key_fd: None,
-            #[cfg(feature = "dbus")]
+            #[cfg(feature = "auto-rotate")]
             accelerometer_orientation: None,
 
             ipc_server,
