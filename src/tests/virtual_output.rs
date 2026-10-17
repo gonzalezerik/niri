@@ -346,3 +346,342 @@ fn virtual_output_scale_applies_via_transient_config() {
 
     assert_eq!(output.current_scale().fractional_scale(), 2.0);
 }
+
+#[test]
+fn virtual_output_ipc_roundtrip_and_naming() {
+    let mut f = Fixture::new();
+
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(
+                &mut state.niri,
+                Some(default_mode()),
+                Some("sunshine".to_owned()),
+            )
+            .unwrap()
+    };
+    assert_eq!(name, "sunshine");
+
+    // The IPC entry carries the real name; make + model give the portal its display name
+    // ("niri sunshine"), not a generic "niri virtual".
+    {
+        let state = f.niri_state();
+        let ipc_map = state.backend.ipc_outputs();
+        let ipc = ipc_map.lock().unwrap();
+        let ipc_output = ipc.values().find(|o| o.name == "sunshine").unwrap();
+        assert_eq!(ipc_output.make, "niri");
+        assert_eq!(ipc_output.model, "sunshine");
+        assert_eq!(ipc_output.modes.len(), 1);
+        assert!(ipc_output.current_mode.is_some());
+        assert!(ipc_output.logical.is_some());
+    }
+
+    {
+        let state = f.niri_state();
+        state
+            .backend
+            .remove_virtual_output(&mut state.niri, "sunshine")
+            .unwrap();
+    }
+
+    assert!(!f
+        .niri()
+        .global_space
+        .outputs()
+        .any(|o| o.name() == "sunshine"));
+    {
+        let state = f.niri_state();
+        let ipc_map = state.backend.ipc_outputs();
+        let ipc = ipc_map.lock().unwrap();
+        assert!(!ipc.values().any(|o| o.name == "sunshine"));
+    }
+}
+
+#[test]
+fn virtual_output_off_on_cycle() {
+    let mut f = Fixture::new();
+
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(
+                &mut state.niri,
+                Some(default_mode()),
+                Some("virt".to_owned()),
+            )
+            .unwrap()
+    };
+
+    let output = f
+        .niri()
+        .global_space
+        .outputs()
+        .find(|o| o.name() == name)
+        .unwrap()
+        .clone();
+
+    // off: disconnected from clients, IPC entry kept with logical: None.
+    {
+        let state = f.niri_state();
+        state.apply_transient_output_config(&name, niri_ipc::OutputAction::Off);
+    }
+    assert!(!f.niri().global_space.outputs().any(|o| o.name() == name));
+    assert!(!f.niri().output_state.contains_key(&output));
+    {
+        let state = f.niri_state();
+        let ipc_map = state.backend.ipc_outputs();
+        let ipc = ipc_map.lock().unwrap();
+        let ipc_output = ipc.values().find(|o| o.name == name).unwrap();
+        assert!(ipc_output.logical.is_none());
+    }
+
+    // on: reconnected with a working frame clock.
+    {
+        let state = f.niri_state();
+        state.apply_transient_output_config(&name, niri_ipc::OutputAction::On);
+    }
+    assert!(f.niri().global_space.outputs().any(|o| o.name() == name));
+    let state = f.niri().output_state.get(&output).unwrap();
+    assert!(state.frame_clock.refresh_interval().is_some());
+    {
+        let state = f.niri_state();
+        let ipc_map = state.backend.ipc_outputs();
+        let ipc = ipc_map.lock().unwrap();
+        let ipc_output = ipc.values().find(|o| o.name == name).unwrap();
+        assert!(ipc_output.logical.is_some());
+    }
+}
+
+#[test]
+fn virtual_output_mode_change_while_off() {
+    let mut f = Fixture::new();
+
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(
+                &mut state.niri,
+                Some(default_mode()),
+                Some("virt".to_owned()),
+            )
+            .unwrap()
+    };
+
+    let output = f
+        .niri()
+        .global_space
+        .outputs()
+        .find(|o| o.name() == name)
+        .unwrap()
+        .clone();
+
+    {
+        let state = f.niri_state();
+        state.apply_transient_output_config(&name, niri_ipc::OutputAction::Off);
+    }
+
+    // The mode is ready when the output is re-enabled.
+    {
+        let state = f.niri_state();
+        state.apply_transient_output_config(
+            &name,
+            niri_ipc::OutputAction::CustomMode {
+                mode: niri_ipc::ConfiguredMode {
+                    width: 1280,
+                    height: 720,
+                    refresh: Some(30.0),
+                },
+            },
+        );
+    }
+    let mode = output.current_mode().unwrap();
+    assert_eq!(mode.size.w, 1280);
+    assert_eq!(mode.size.h, 720);
+    assert_eq!(mode.refresh, 30_000);
+
+    {
+        let state = f.niri_state();
+        state.apply_transient_output_config(&name, niri_ipc::OutputAction::On);
+    }
+    let mode = output.current_mode().unwrap();
+    assert_eq!(mode.size.w, 1280);
+    let state = f.niri().output_state.get(&output).unwrap();
+    let interval = state.frame_clock.refresh_interval().unwrap();
+    assert!(
+        (interval.as_nanos() as f64 - 1e9 / 30.0).abs() < 1e6,
+        "unexpected frame clock interval: {interval:?}",
+    );
+}
+
+#[test]
+fn virtual_output_pacing_advances_frame_sequence() {
+    use std::time::{Duration, Instant};
+
+    use calloop::timer::{TimeoutAction, Timer};
+
+    let mut f = Fixture::new();
+
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(
+                &mut state.niri,
+                Some(niri_ipc::ConfiguredMode {
+                    width: 800,
+                    height: 600,
+                    refresh: Some(100.0),
+                }),
+                Some("virt".to_owned()),
+            )
+            .unwrap()
+    };
+
+    let output = f
+        .niri()
+        .global_space
+        .outputs()
+        .find(|o| o.name() == name)
+        .unwrap()
+        .clone();
+
+    // Keep the output busy so the synthetic clock keeps producing frames: a fast timer queues
+    // a redraw and pumps the compositor (including the server event loop where the output's
+    // estimated-vblank timer lives). The vblank timer then paces actual renders at the mode
+    // rate (a queued redraw mid-wait must not jump the queue).
+    let output_for_timer = output.clone();
+    f.handle
+        .insert_source(
+            Timer::from_duration(Duration::from_millis(2)),
+            move |_, _, state| {
+                state.server.state.niri.queue_redraw(&output_for_timer);
+                state.server.dispatch();
+                TimeoutAction::ToDuration(Duration::from_millis(2))
+            },
+        )
+        .unwrap();
+
+    f.dispatch();
+
+    let start = f.niri().output_state[&output].frame_callback_sequence;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(300) {
+        std::thread::sleep(Duration::from_millis(5));
+        f.dispatch();
+    }
+    let elapsed = t0.elapsed();
+    let end = f.niri().output_state[&output].frame_callback_sequence;
+    let delta = end.wrapping_sub(start);
+
+    // The sequence advances twice per paced frame (once on render, once on the synthetic
+    // vblank). Loose bounds: this must be far above zero (clock dead) and far below the
+    // unthrottled driver rate (500 Hz queueing).
+    let frames = elapsed.as_secs_f64() * 100.0;
+    assert!(
+        (delta as f64) >= frames && (delta as f64) <= frames * 4.0,
+        "frame_callback_sequence advanced by {delta} in {elapsed:?}; expected ~{} (paced at 100 Hz)",
+        frames as u32,
+    );
+}
+
+#[test]
+fn virtual_output_scale_affects_logical_geometry_and_mapping() {
+    let mut f = Fixture::new();
+
+    // A scale-1 physical-ish output at the origin.
+    f.add_output(1, (1280, 720));
+
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(
+                &mut state.niri,
+                Some(niri_ipc::ConfiguredMode {
+                    width: 1920,
+                    height: 1080,
+                    refresh: Some(60.0),
+                }),
+                Some("virt".to_owned()),
+            )
+            .unwrap()
+    };
+
+    {
+        let state = f.niri_state();
+        state.apply_transient_output_config(
+            &name,
+            niri_ipc::OutputAction::Scale {
+                scale: niri_ipc::ScaleToSet::Specific(2.0),
+            },
+        );
+    }
+
+    let virt = f
+        .niri()
+        .global_space
+        .outputs()
+        .find(|o| o.name() == name)
+        .unwrap()
+        .clone();
+
+    // Logical size is physical size / scale, so absolute input mapping uses the scaled size.
+    let geom = f.niri().global_space.output_geometry(&virt).unwrap();
+    assert_eq!(geom.size.w, 960);
+    assert_eq!(geom.size.h, 540);
+
+    // The virtual output is placed to the right of the first one, and absolute input mapping
+    // uses logical (scaled) geometry: a point in the virtual output's logical rect belongs to
+    // it, not to the first output.
+    assert_eq!(geom.loc.x, 1280);
+    let first = f.niri().global_space.outputs().next().unwrap().clone();
+    let first_geom = f.niri().global_space.output_geometry(&first).unwrap();
+    assert_eq!(first_geom.size.w, 1280);
+    let inside = |g: smithay::utils::Rectangle<i32, smithay::utils::Logical>, p: (i32, i32)| {
+        p.0 >= g.loc.x && p.0 < g.loc.x + g.size.w && p.1 >= g.loc.y && p.1 < g.loc.y + g.size.h
+    };
+    let point = (1300, 100);
+    assert!(!inside(first_geom, point));
+    assert!(inside(geom, point));
+}
+
+#[test]
+fn tablet_map_to_output_targets_virtual_output() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let name = {
+        let state = f.niri_state();
+        state
+            .backend
+            .create_virtual_output(
+                &mut state.niri,
+                Some(default_mode()),
+                Some("virt".to_owned()),
+            )
+            .unwrap()
+    };
+
+    {
+        let state = f.niri_state();
+        let mut config = state.niri.config.borrow_mut();
+        config.input.tablet.map_to_focused_output = false;
+        config.input.tablet.map_to_output = Some(name.clone());
+    }
+
+    // Focus the other output; the tablet must still map to the virtual one.
+    f.niri_focus_output(1);
+
+    let virt = f
+        .niri()
+        .global_space
+        .outputs()
+        .find(|o| o.name() == name)
+        .unwrap()
+        .clone();
+    assert_eq!(f.niri().output_for_tablet(), Some(&virt));
+}
