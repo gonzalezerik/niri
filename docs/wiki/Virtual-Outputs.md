@@ -1,7 +1,8 @@
 # Virtual Outputs
 
-Virtual outputs are extra `wl_output`s (usually named `HEADLESS-*`) that niri can create even when
-there’s no physical monitor attached (or in addition to real monitors).
+Virtual outputs are extra `wl_output`s that niri can create even when there’s no physical monitor
+attached (or in addition to real monitors). By default they’re named `HEADLESS-1`, `HEADLESS-2`,
+etc., or you can give them your own name.
 
 They’re useful for:
 
@@ -9,32 +10,28 @@ They’re useful for:
 - VNC (e.g. wayvnc)
 - “headless” remote sessions and general screen sharing
 
+Virtual outputs work on the TTY and Headless backends (not the Winit backend).
+
 ## Creating virtual outputs
-
-### TTY backend (regular session with physical displays)
-
-When running niri on a TTY with your physical monitor, you can create additional virtual outputs:
 
 ```bash
 # Create a 1920x1080@144 virtual output named "sunshine"
-niri msg create-virtual-output \
-  --name sunshine \
-  --mode 1920x1080@144
+niri msg create-virtual-output --name sunshine --mode 1920x1080@144
 
-# Optionally set a scale factor:
+# With a scale factor:
 niri msg create-virtual-output --name sunshine --mode 1920x1080@144 --scale 1.25
-
-# If --name is omitted, a unique HEADLESS-N name is generated.
-# If --mode is omitted, the default is 1920x1080@60.
-# If an output with the given name already exists and is virtual, it is resized in place
-# instead of creating a new one.
 ```
 
-If you want to see what exists:
+- `--mode` is `WIDTHxHEIGHT[@REFRESH]`; the refresh rate is optional and defaults to 60 Hz.
+  If `--mode` is omitted entirely, the default is `1920x1080@60`.
+- If `--name` is omitted, a unique `HEADLESS-N` name is generated.
+- If an output with the given name already exists and is virtual, it is **resized in place**
+  instead of creating a new one (re-running the command with a new mode is the intended way to
+  change a live virtual output’s mode; `niri msg output NAME mode …` works too).
+- Modes are validated: dimensions must be 16..=16384 per side, refresh rate > 0 and ≤ 1000 Hz.
 
-```bash
-niri msg outputs
-```
+To see what exists, use `niri msg outputs` — virtual outputs show up there with their real name
+(`make` is `niri`, `model` is the output name).
 
 ### Headless backend (no physical displays)
 
@@ -49,35 +46,48 @@ NIRI_BACKEND=headless niri --session &
 Note: if you’re running commands from another shell, you may need to set `WAYLAND_DISPLAY` to the
 socket of that headless session.
 
+On machines with multiple GPUs, the headless backend’s EGL renderer can end up on software
+rendering, which breaks dmabuf capture. Point niri at the render node you want:
+
+```kdl
+debug {
+    render-drm-device "/dev/dri/renderD128"
+}
+```
+
 ## Removing virtual outputs
 
 ```bash
 niri msg remove-virtual-output sunshine
-# Output: Removed virtual output: sunshine
 ```
+
+Outputs declared with `create-virtual` in the config cannot be removed over IPC while they’re in
+the config — remove or disable them there instead.
 
 ## Configuring virtual outputs
 
 Virtual outputs can be configured like regular outputs:
 
 ```bash
-# Enable/disable
-niri msg output HEADLESS-1 <on|off>
+# Enable/disable (off disconnects the output from clients but keeps it ready)
+niri msg output sunshine <on|off>
 
 # Set scale
-niri msg output HEADLESS-1 scale 1.25
+niri msg output sunshine scale 1.25
 
 # Set transform
-niri msg output HEADLESS-1 transform 90
+niri msg output sunshine transform 90
+
+# Change the mode (same custom mode as create-virtual-output --mode)
+niri msg output sunshine custom-mode 2560x1440@120
 ```
 
-You can also configure them in your `config.kdl` file.
+These are temporary (like all `niri msg output` changes) and are forgotten on the next config
+reload. Mode changes while the output is `off` are applied when it’s enabled again.
 
-If you want niri to *create* a named virtual output automatically (at compositor startup and on
-config reload), add the `create-virtual` flag to the corresponding `output` block.
-
-Note: this works only on the TTY and Headless backends (virtual outputs are not supported on the
-Winit backend).
+You can also configure them in your `config.kdl` file. If you want niri to *create* a named
+virtual output automatically (at compositor startup and on config reload), add the
+`create-virtual` flag to the corresponding `output` block:
 
 ```kdl
 output "sunshine" {
@@ -89,13 +99,38 @@ output "sunshine" {
 }
 ```
 
+## Screen-capture behavior
+
+Virtual outputs are rendered on a synthetic frame clock that ticks at the output’s refresh rate,
+independent of any capture client. Capture is never throttled below the mode’s refresh rate.
+
+Capture is zero-copy where the client uses dmabufs: Sunshine’s wlgrab allocates dmabuf buffers on
+the render node niri advertises via linux-dmabuf feedback, and niri renders directly into them.
+Clients that pass SHM buffers (e.g. `grim` by default) get the normal SHM path.
+
+The portal (xdg-desktop-portal-gnome / -gtk) shows virtual outputs by their real name: the
+display name is `"{make} {model}"`, i.e. “niri sunshine” for an output named `sunshine`.
+
 ## Using with Sunshine
 
-If you want, you can tell [Sunshine](https://github.com/LizardByte/Sunshine) to create a virtual output that matches the client ([Moonlight](https://github.com/moonlight-stream/moonlight-qt)) resolution + refresh rate when a session starts, and remove it when the session ends.
+[Sunshine](https://github.com/LizardByte/Sunshine) can create a virtual output that matches the
+client ([Moonlight](https://github.com/moonlight-stream/moonlight-qt)) resolution + refresh rate
+when a session starts, and remove it when the session ends. Sunshine exposes
+`SUNSHINE_CLIENT_WIDTH`, `SUNSHINE_CLIENT_HEIGHT` and `SUNSHINE_CLIENT_FPS` for this.
 
-The snippets below are intentionally minimal; adjust them to your Sunshine setup.
+In `sunshine.conf`, use the wlr capture backend and a global prep command:
 
-### TTY backend (create + remove per session)
+```ini
+capture = wlr
+output_name = sunshine
+
+global_prep_cmd = [{"do":"sh -c \"niri msg create-virtual-output --name sunshine --mode ${SUNSHINE_CLIENT_WIDTH}x${SUNSHINE_CLIENT_HEIGHT}@${SUNSHINE_CLIENT_FPS}\"","undo":"niri msg remove-virtual-output sunshine"}]
+```
+
+Because `create-virtual-output` resizes an existing output in place, the `do` command is safe to
+re-run when a client connects with a different resolution.
+
+Alternatively, keep it per-app in `apps.json`:
 
 ```json
 {
@@ -156,7 +191,10 @@ injects input over Wayland (like wayvnc), niri doesn’t need access to `/dev/in
 
 ## Using with wayvnc
 
-[wayvnc](https://github.com/any1/wayvnc) is a VNC server for wlroots-based Wayland compositors. It forwards keyboard and pointer input from VNC clients to the compositor using Wayland “virtual input” protocols (virtual keyboard + virtual pointer). This means you can have working remote input even if the headless niri process can’t open `/dev/input/event*`.
+[wayvnc](https://github.com/any1/wayvnc) is a VNC server for wlroots-based Wayland compositors. It
+forwards keyboard and pointer input from VNC clients to the compositor using Wayland “virtual
+input” protocols (virtual keyboard + virtual pointer). This means you can have working remote input
+even if the headless niri process can’t open `/dev/input/event*`.
 
 ### Physical displays + extra virtual output
 
