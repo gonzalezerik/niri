@@ -50,6 +50,42 @@ color-profile "eDP-1" {
 - HDR options: [Configuration: Outputs, `hdr`](docs/wiki/Configuration:-Outputs.md#hdr). HDR is experimental: it is limited to a single fullscreen application, and screenshots of HDR content come out in SDR.
 - Color profiles: [Configuration: Color Profiles](docs/wiki/Configuration:-Color-Profiles.md).
 
+## Bugs encountered
+
+Bugs I hit while running this branch on my two machines, in the compositor and in the apps used with it. I don't open pull requests on niri or comment on upstream issues from this fork; this is the record.
+
+### HDR, gaming and video
+
+| Bug | In | Upstream issue | Fix |
+|---|---|---|---|
+| The branch didn't build on its own: `Cargo.toml` pointed Smithay at a local `../smithay` checkout | dividebysandwich/niri | none (issues are disabled on that repository) | Pinned to `dividebysandwich/smithay` `ds-hdr-master` ([6fa1bda3](https://github.com/gonzalezerik/niri/commit/6fa1bda3)) |
+| AMD GPU page fault, freezing the desktop, right after leaving HDR | dividebysandwich/niri | none | [0a94298b](https://github.com/gonzalezerik/niri/commit/0a94298b), PR [#4](https://github.com/dividebysandwich/niri/pull/4) |
+| The 10-bit probe frame's buffers were freed while the GPU could still be using them | dividebysandwich/niri | none | [724d3eb0](https://github.com/gonzalezerik/niri/commit/724d3eb0), PR [#5](https://github.com/dividebysandwich/niri/pull/5) |
+| HDR → SDR → HDR (three mode switches) every time mpv goes fullscreen | dividebysandwich/niri | none | [08691922](https://github.com/gonzalezerik/niri/commit/08691922), PR [#6](https://github.com/dividebysandwich/niri/pull/6) |
+| Games in nested gamescope start in SDR | dividebysandwich/niri | none | [bc31fd6d](https://github.com/gonzalezerik/niri/commit/bc31fd6d), PR [#7](https://github.com/dividebysandwich/niri/pull/7) |
+| A game in nested gamescope stays SDR for the whole session if another window had focus when it created its swapchain | this branch's HDR (HDR is only offered to the focused fullscreen window) together with gamescope | none | Not fixed in niri. Workaround: `--hdr-debug-force-support` in the game's gamescope launch option |
+| Nested gamescope loses its `app_id` after its window is unmapped, so the `^gamescope$` VRR window rule stops matching | gamescope | [ValveSoftware/gamescope#2446](https://github.com/ValveSoftware/gamescope/issues/2446) (closed) | Fixed upstream in [e0602ccc](https://github.com/ValveSoftware/gamescope/commit/e0602ccc313b6dee0dabb09c67e50a28eb784de9), not in a release yet (3.16.31); my NixOS config applies that commit to gamescope |
+| Spider-Man Remastered crashes gamescope: gamescope passes on the game's invalid HDR metadata and niri rejects it with a protocol error | gamescope | none for this case; related: [ValveSoftware/gamescope#2249](https://github.com/ValveSoftware/gamescope/issues/2249) | niri is right to reject it. Workaround: the game's peak-brightness setting raised to the display's real peak |
+| Firefox is disconnected mid-video: its `wp_viewport` source rectangle overshoots the buffer by 1/256 px | Firefox | [Mozilla bug 2062135](https://bugzilla.mozilla.org/show_bug.cgi?id=2062135) (assigned, patch in review) | niri follows the protocol here, so nothing to fix in niri. Firefox is no longer installed on either machine |
+| Jellium Desktop's Wayland proxy deletes Flatpak's link to the compositor socket, so every later launch fails with "Connection refused" | Jellium Desktop | none | Flatpak override `--filesystem=xdg-run/wayland-1.lock:ro` |
+
+### Virtual outputs
+
+Bugs found while building virtual outputs on [niri-wm/niri#3800](https://github.com/niri-wm/niri/pull/3800). That work is on a separate local branch and is not in `erikg-hdr` yet; the commit ids below are on that branch.
+
+| Bug | In | Upstream issue | Fix |
+|---|---|---|---|
+| Clients on a virtual output never get a frame reported as presented, so frame pacing falls back to guesswork | #3800 | none | `1b8ef36a` |
+| #3800's redraw change also delays physical monitors by up to one refresh | #3800 | none | `1b8ef36a` (the change now applies to virtual outputs only) |
+| `power-off-monitors` also stops virtual outputs, so a remote stream drops to about 1 frame per second; locking while monitors are off counted the session as locked without drawing the lock screen on them | #3800 | none; related, for physical monitors: [niri-wm/niri#3295](https://github.com/niri-wm/niri/issues/3295) (open) | `981ad038` |
+| The headless backend renders on whichever GPU EGL picks, possibly software rendering, so capture clients like Sunshine lose zero-copy | #3800 | none | `e14d229a` (renders on `debug { render-drm-device }`) |
+| A refresh rate of 0 or an extreme value is accepted (0 divides by zero) | #3800 | none; flagged in review on [niri-wm/niri#3953](https://github.com/niri-wm/niri/pull/3953) | `defe8a89` |
+| On a machine with Mesa and the NVIDIA driver, the render node could be opened through the wrong EGL vendor and fall back to an arbitrary GPU | my own `e14d229a` | none | `0b20ed59` |
+
+### No bugs found so far
+
+Auto-rotate, per-output color profiles and the `float-above-fullscreen` window rule.
+
 ## Status
 
 Personal and experimental; tested only on my two machines. Please don't report problems with this branch to upstream niri.
