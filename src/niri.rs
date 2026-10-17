@@ -127,7 +127,9 @@ use wayland_server::protocol::wl_output::WlOutput;
 use crate::a11y::A11y;
 use crate::animation::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
-use crate::backend::{Backend, Headless, OutputHdrCaps, RenderResult, Tty, Winit};
+use crate::backend::{
+    Backend, Headless, OutputHdrCaps, RenderResult, Tty, VirtualOutputMarker, Winit,
+};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
@@ -4389,11 +4391,22 @@ impl Niri {
     }
 
     pub fn redraw_queued_outputs(&mut self, backend: &mut Backend) {
-        while let Some((output, _)) = self
-            .output_state
-            .iter()
-            .find(|(_, state)| matches!(state.redraw_state, RedrawState::Queued))
-        {
+        let _span = tracy_client::span!("Niri::redraw_queued_outputs");
+
+        while let Some((output, _)) = self.output_state.iter().find(|(output, state)| {
+            match state.redraw_state {
+                RedrawState::Queued => true,
+                // Virtual outputs pace *all* redraws through their synthetic estimated-vblank
+                // clock, so a capture or damage request arriving mid-wait waits for the next
+                // synthetic vblank instead of jumping the queue. Physical outputs keep
+                // redrawing immediately so they don't gain latency.
+                RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
+                    output.user_data().get::<VirtualOutputMarker>().is_none()
+                }
+                _ => false,
+            }
+        }) {
+            trace!("redrawing output");
             let output = output.clone();
             self.redraw(backend, &output);
         }
@@ -6020,6 +6033,69 @@ impl Niri {
                         surface,
                         None,
                         render_element_states,
+                    )
+                },
+            );
+        }
+
+        feedback
+    }
+
+    /// Like [`Self::take_presentation_feedbacks`], but for virtual outputs.
+    ///
+    /// Virtual outputs never go through the scanout pass that sets
+    /// `surface_primary_scanout_output`, so the normal filter would never take any feedback and
+    /// they would accumulate forever. Take unconditionally for this output, mirroring
+    /// [`Self::send_frame_callbacks_for_virtual_output`] (and skipping cursor/DnD for the same
+    /// reason). No render element states are available since nothing is scanned out, so the
+    /// feedback flags come out empty.
+    pub fn take_presentation_feedbacks_for_virtual_output(
+        &mut self,
+        output: &Output,
+    ) -> OutputPresentationFeedback {
+        let _span = tracy_client::span!("Niri::take_presentation_feedbacks_for_virtual_output");
+
+        let render_element_states = RenderElementStates::default();
+        let mut feedback = OutputPresentationFeedback::new(output);
+
+        for mapped in self.layout.windows_for_output(output) {
+            mapped.window.take_presentation_feedback(
+                &mut feedback,
+                |_, _| Some(output.clone()),
+                |surface, _| {
+                    surface_presentation_feedback_flags_from_states(
+                        surface,
+                        None,
+                        &render_element_states,
+                    )
+                },
+            )
+        }
+
+        for surface in layer_map_for_output(output).layers() {
+            surface.take_presentation_feedback(
+                &mut feedback,
+                |_, _| Some(output.clone()),
+                |surface, _| {
+                    surface_presentation_feedback_flags_from_states(
+                        surface,
+                        None,
+                        &render_element_states,
+                    )
+                },
+            );
+        }
+
+        if let Some(surface) = &self.output_state[output].lock_surface {
+            take_presentation_feedback_surface_tree(
+                surface.wl_surface(),
+                &mut feedback,
+                |_, _| Some(output.clone()),
+                |surface, _| {
+                    surface_presentation_feedback_flags_from_states(
+                        surface,
+                        None,
+                        &render_element_states,
                     )
                 },
             );

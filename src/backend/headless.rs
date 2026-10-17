@@ -17,7 +17,6 @@ use smithay::backend::drm::DrmNode;
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::libinput::LibinputInputBackend;
-use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{ImportDma, ImportEgl};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -333,8 +332,8 @@ impl Headless {
     ) -> RenderResult {
         let now = get_monotonic_time();
 
-        let states = RenderElementStates::default();
-        let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
+        let mut presentation_feedbacks =
+            niri.take_presentation_feedbacks_for_virtual_output(output);
         presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
             now,
             Refresh::Unknown,
@@ -342,11 +341,19 @@ impl Headless {
             wp_presentation_feedback::Kind::empty(),
         );
 
-        let output_state = niri.output_state.get_mut(output).unwrap();
+        let Some(output_state) = niri.output_state.get_mut(output) else {
+            error!("missing output state for output {}", output.name());
+            return RenderResult::Skipped;
+        };
+
         match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
-            RedrawState::Idle => unreachable!(),
-            RedrawState::Queued => (),
-            RedrawState::WaitingForVBlank { .. } => unreachable!(),
+            RedrawState::Idle | RedrawState::Queued => (),
+            RedrawState::WaitingForVBlank { .. } => {
+                error!(
+                    "headless output {} was waiting for a real vblank",
+                    output.name()
+                );
+            }
             RedrawState::WaitingForEstimatedVBlank(token)
             | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
                 niri.event_loop.remove(token);
@@ -366,7 +373,11 @@ impl Headless {
         let token = niri
             .event_loop
             .insert_source(timer, move |_, _, data| {
-                let output_state = data.niri.output_state.get_mut(&output_clone).unwrap();
+                let Some(output_state) = data.niri.output_state.get_mut(&output_clone) else {
+                    // The output was removed while the timer was pending; nothing to pace.
+                    return TimeoutAction::Drop;
+                };
+
                 output_state.frame_callback_sequence =
                     output_state.frame_callback_sequence.wrapping_add(1);
 
@@ -376,7 +387,9 @@ impl Headless {
                         output_state.redraw_state = RedrawState::Queued;
                         return TimeoutAction::Drop;
                     }
-                    _ => unreachable!(),
+                    // The output was reset (e.g. removed and re-added) while the timer was
+                    // pending; drop the timer.
+                    _ => return TimeoutAction::Drop,
                 }
 
                 if output_state.unfinished_animations_remain {

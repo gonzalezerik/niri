@@ -68,6 +68,7 @@ use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
 
+use crate::backend::VirtualOutputMarker;
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
 use crate::input::click_grab::ClickGrab;
 use crate::layout::workspace::WorkspaceId;
@@ -643,7 +644,15 @@ impl ScreencopyHandler for State {
         // If with_damage then push it onto the queue for redraw of the output,
         // otherwise render it immediately.
         if screencopy.with_damage() {
+            let output = screencopy.output().clone();
             self.niri.screencopy_state.push(manager, screencopy);
+
+            // Virtual outputs go idle when nothing changes, so nudge them: the queued capture
+            // gets evaluated on the next synthetic frame instead of waiting for unrelated
+            // damage. Physical outputs keep the standard damage-driven semantics.
+            if VirtualOutputMarker::is_virtual(&output) {
+                self.niri.queue_redraw(&output);
+            }
         } else {
             self.backend.with_primary_renderer(|renderer| {
                 if let Err(err) = self

@@ -2991,13 +2991,12 @@ impl Tty {
         output: &Output,
         target_presentation_time: Duration,
     ) -> RenderResult {
-        use smithay::backend::renderer::element::RenderElementStates;
         use smithay::wayland::presentation::Refresh;
 
         let now = get_monotonic_time();
 
-        let states = RenderElementStates::default();
-        let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
+        let mut presentation_feedbacks =
+            niri.take_presentation_feedbacks_for_virtual_output(output);
         presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
             now,
             Refresh::Unknown,
