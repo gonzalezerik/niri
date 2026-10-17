@@ -8,3 +8,9 @@ WRONLY = "WRONLY"
 
 [default.extend-words]
 datas = "datas"
+# "max content light level", a wp-color-management / CTA-861 term.
+cll = "cll"
+# Pre-existing upstream words, allowlisted to avoid touching upstream code:
+# the intentional "O{…}utput" markup split in mru.rs, and a comment typo.
+utput = "utput"
+immediatelly = "immediatelly"
