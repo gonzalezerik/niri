@@ -122,15 +122,7 @@ pub struct Tty {
     debug_tint: bool,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     // Virtual outputs that we manage and mirror to IPC, indexed by output name.
-    virtual_outputs: VirtualOutputs,
-}
-
-/// State related to managing virtual outputs (e.g. HEADLESS-* outputs).
-struct VirtualOutputs {
-    /// Counter for generating unique virtual output names and IDs.
-    counter: u32,
-    /// Virtual outputs indexed by output name.
-    outputs: HashMap<String, (Output, OutputId)>,
+    virtual_outputs: virtual_output::VirtualOutputs,
 }
 
 pub type TtyRenderer<'render> = MultiRenderer<
@@ -766,10 +758,7 @@ impl Tty {
             update_output_config_on_resume: false,
             debug_tint: false,
             ipc_outputs: Arc::new(Mutex::new(HashMap::new())),
-            virtual_outputs: VirtualOutputs {
-                counter: 0,
-                outputs: HashMap::new(),
-            },
+            virtual_outputs: virtual_output::VirtualOutputs::new(),
         })
     }
 
@@ -2949,7 +2938,7 @@ impl Tty {
         // Since these are not DRM connectors, the loop above does not include them.
         // If we drop them here, `niri msg outputs` will act as if they are disconnected and
         // subsequent `niri msg output HEADLESS-* ...` commands will report "not connected".
-        for (name, (output, output_id)) in &self.virtual_outputs.outputs {
+        for (name, (output, output_id)) in self.virtual_outputs.iter() {
             let current_mode = output.current_mode();
             let Some(mode) = current_mode else {
                 continue;
@@ -3037,84 +3026,27 @@ impl Tty {
         refresh_rate: u32,
         name: Option<String>,
     ) -> Result<String, String> {
-        let mut width = width;
-        let mut height = height;
-        let mut refresh_millihz = refresh_rate.saturating_mul(1000);
-        let mut should_connect = true;
+        let refresh_millihz = refresh_rate.saturating_mul(1000);
 
-        if let Some(name) = name.as_deref() {
-            if name.trim().is_empty() {
-                return Err("virtual output name cannot be empty".to_string());
-            }
-
-            let lookup_name = niri_config::OutputName {
-                connector: name.to_string(),
-                make: None,
-                model: None,
-                serial: None,
-            };
-            let config = self.config.borrow();
-            if let Some(output_config) = config.outputs.find(&lookup_name) {
-                should_connect = !output_config.off;
-
-                if let Some(mode_config) = output_config.mode {
-                    width = mode_config.mode.width;
-                    height = mode_config.mode.height;
-
-                    let refresh_hz = mode_config.mode.refresh.unwrap_or(60.0);
-                    refresh_millihz =
-                        (refresh_hz * 1000.0).round().clamp(1.0, u32::MAX as f64) as u32;
-                }
-            }
-
-            if self.virtual_outputs.outputs.contains_key(name)
-                || niri.global_space.outputs().any(|o| o.name() == name)
-            {
-                return Err(format!("output '{name}' already exists"));
-            }
-        }
-
-        let built = virtual_output::build_headless_virtual_output(
-            &mut self.virtual_outputs.counter,
+        let name = self.virtual_outputs.create(
+            niri,
+            &self.ipc_outputs,
             width,
             height,
             refresh_millihz,
             name,
-        );
-
-        if self.virtual_outputs.outputs.contains_key(&built.name)
-            || niri.global_space.outputs().any(|o| o.name() == built.name)
-        {
-            return Err(format!("output '{}' already exists", built.name));
-        }
-
-        self.ipc_outputs
-            .lock()
-            .unwrap()
-            .insert(built.output_id, built.ipc_output);
-
-        self.virtual_outputs
-            .outputs
-            .insert(built.name.clone(), (built.output.clone(), built.output_id));
-
-        if should_connect {
-            niri.add_output(built.output, Some(built.refresh_interval), false);
-        }
+        )?;
 
         // Ensure IPC reflects the configured mode immediately.
         self.refresh_ipc_outputs(niri);
 
-        Ok(built.name)
+        Ok(name)
     }
 
     pub fn remove_virtual_output(&mut self, niri: &mut Niri, name: &str) -> Result<(), String> {
-        virtual_output::remove_virtual_output_from_map(
-            niri,
-            &self.ipc_outputs,
-            &mut self.virtual_outputs.outputs,
-            name,
-            "virtual output",
-        )
+        self.virtual_outputs.remove(niri, &self.ipc_outputs, name)?;
+        self.refresh_ipc_outputs(niri);
+        Ok(())
     }
 
     #[cfg(feature = "xdp-gnome-screencast")]
@@ -3472,12 +3404,7 @@ impl Tty {
         // Apply config changes to virtual outputs (HEADLESS-*).
         {
             let config = self.config.clone();
-            virtual_output::apply_config_to_managed_virtual_outputs(
-                niri,
-                &mut self.virtual_outputs.outputs,
-                None,
-                &config,
-            );
+            self.virtual_outputs.apply_config(niri, None, &config);
         }
 
         self.refresh_ipc_outputs(niri);

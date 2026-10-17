@@ -1,6 +1,5 @@
 //! Note: This backend has limited DMA-BUF support intended for screencopy.
 
-use std::collections::HashMap;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -57,10 +56,8 @@ pub struct Headless {
     ///
     /// This defaults to `seat0` and can be overridden with `XDG_SEAT`.
     udev_seat: String,
-    /// Counter for auto-naming headless outputs (HEADLESS-1, HEADLESS-2, etc.)
-    output_counter: u32,
-    /// Track outputs by name for removal, storing (Output, OutputId)
-    outputs: HashMap<String, (Output, OutputId)>,
+    /// Virtual outputs managed by this backend.
+    virtual_outputs: virtual_output::VirtualOutputs,
 }
 
 impl Headless {
@@ -76,8 +73,7 @@ impl Headless {
             gbm: None,
             ipc_outputs: Default::default(),
             udev_seat,
-            output_counter: 0,
-            outputs: HashMap::new(),
+            virtual_outputs: virtual_output::VirtualOutputs::new(),
         }
     }
 
@@ -165,7 +161,7 @@ impl Headless {
         // In real headless sessions we want a default output so clients have something to render
         // on. In tests, the harness explicitly creates predictable `headless-N` outputs; creating
         // an extra default `HEADLESS-1` here causes name collisions and snapshot churn.
-        if self.outputs.is_empty() && !cfg!(test) {
+        if self.virtual_outputs.iter().next().is_none() && !cfg!(test) {
             let _ = self.create_virtual_output(niri, 1920, 1080, 60, None);
         }
     }
@@ -299,87 +295,28 @@ impl Headless {
         refresh_rate: u32,
         name: Option<String>,
     ) -> Result<String, String> {
-        let mut width = width;
-        let mut height = height;
-        let mut refresh_millihz = refresh_rate.saturating_mul(1000);
-        let mut should_connect = true;
+        let refresh_millihz = refresh_rate.saturating_mul(1000);
 
-        if let Some(name) = name.as_deref() {
-            let lookup_name = OutputName {
-                connector: name.to_string(),
-                make: None,
-                model: None,
-                serial: None,
-            };
-            let config = niri.config.borrow();
-            if let Some(output_config) = config.outputs.find(&lookup_name) {
-                should_connect = !output_config.off;
-
-                if let Some(mode_config) = output_config.mode {
-                    width = mode_config.mode.width;
-                    height = mode_config.mode.height;
-
-                    let refresh_hz = mode_config.mode.refresh.unwrap_or(60.0);
-                    refresh_millihz =
-                        (refresh_hz * 1000.0).round().clamp(1.0, u32::MAX as f64) as u32;
-                }
-            }
-        }
-
-        if let Some(name) = name.as_deref() {
-            if name.trim().is_empty() {
-                return Err("virtual output name cannot be empty".to_string());
-            }
-            if self.outputs.contains_key(name)
-                || niri.global_space.outputs().any(|o| o.name() == name)
-            {
-                return Err(format!("output '{name}' already exists"));
-            }
-        }
-
-        let built = virtual_output::build_headless_virtual_output(
-            &mut self.output_counter,
+        let name = self.virtual_outputs.create(
+            niri,
+            &self.ipc_outputs,
             width,
             height,
             refresh_millihz,
             name,
-        );
-
-        if self.outputs.contains_key(&built.name)
-            || niri.global_space.outputs().any(|o| o.name() == built.name)
-        {
-            return Err(format!("output '{}' already exists", built.name));
-        }
-
-        self.ipc_outputs
-            .lock()
-            .unwrap()
-            .insert(built.output_id, built.ipc_output);
-
-        self.outputs
-            .insert(built.name.clone(), (built.output.clone(), built.output_id));
-
-        if should_connect {
-            niri.add_output(built.output, Some(built.refresh_interval), false);
-        }
+        )?;
 
         // Ensure IPC state matches the (potentially) configured mode and connection state.
         niri.ipc_outputs_changed = true;
         self.on_output_config_changed(niri);
 
-        Ok(built.name)
+        Ok(name)
     }
 
     /// Remove the virtual output with the given name.
     /// Returns an error if no such virtual output exists.
     pub fn remove_virtual_output(&mut self, niri: &mut Niri, name: &str) -> Result<(), String> {
-        virtual_output::remove_virtual_output_from_map(
-            niri,
-            &self.ipc_outputs,
-            &mut self.outputs,
-            name,
-            "output",
-        )
+        self.virtual_outputs.remove(niri, &self.ipc_outputs, name)
     }
 
     pub fn seat_name(&self) -> String {
@@ -499,12 +436,8 @@ impl Headless {
 
     pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
         let config = niri.config.clone();
-        virtual_output::apply_config_to_managed_virtual_outputs(
-            niri,
-            &mut self.outputs,
-            Some(&self.ipc_outputs),
-            &config,
-        );
+        self.virtual_outputs
+            .apply_config(niri, Some(&self.ipc_outputs), &config);
     }
 
     pub fn ipc_outputs(&self) -> Arc<Mutex<IpcOutputMap>> {
@@ -524,8 +457,7 @@ impl Default for Headless {
             gbm: None,
             ipc_outputs: Default::default(),
             udev_seat: "seat0".to_string(),
-            output_counter: 0,
-            outputs: HashMap::new(),
+            virtual_outputs: virtual_output::VirtualOutputs::new(),
         }
     }
 }
