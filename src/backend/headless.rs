@@ -82,7 +82,8 @@ impl Headless {
     }
 
     pub fn init(&mut self, niri: &mut Niri) {
-        if let Err(err) = self.add_renderer() {
+        let render_drm_device = niri.config.borrow().debug.render_drm_device.clone();
+        if let Err(err) = self.add_renderer(render_drm_device.as_deref()) {
             warn!("failed to create headless renderer: {err:?}");
         } else if let Some(renderer) = self.renderer.as_mut() {
             if let Err(err) = renderer.bind_wl_display(&niri.display_handle) {
@@ -165,15 +166,32 @@ impl Headless {
         }
     }
 
-    pub fn add_renderer(&mut self) -> anyhow::Result<()> {
+    pub fn add_renderer(&mut self, render_drm_device: Option<&Path>) -> anyhow::Result<()> {
         if self.renderer.is_some() {
             error!("add_renderer: renderer must not already exist");
             return Ok(());
         }
 
         let mut renderer = unsafe {
-            let display =
-                EGLDisplay::new(EGLSurfacelessDisplay).context("error creating EGL display")?;
+            // With `debug { render-drm-device ... }`, render on that node via
+            // EGL_EXT_platform_device. The surfaceless platform picks a device on its own and may
+            // land on software rendering on multi-GPU boxes, which then advertises no usable
+            // dmabuf formats.
+            let display = match render_drm_device {
+                Some(path) => match egl_display_for_render_node(path) {
+                    Ok(display) => display,
+                    Err(err) => {
+                        warn!(
+                            "headless: failed to create EGL display for render device {path:?}: {err:?}; falling back to surfaceless"
+                        );
+                        EGLDisplay::new(EGLSurfacelessDisplay)
+                            .context("error creating EGL display")?
+                    }
+                },
+                None => {
+                    EGLDisplay::new(EGLSurfacelessDisplay).context("error creating EGL display")?
+                }
+            };
 
             self.render_node = EGLDevice::device_for_display(&display)
                 .ok()
@@ -464,6 +482,18 @@ impl Default for Headless {
             virtual_outputs: virtual_output::VirtualOutputs::new(),
         }
     }
+}
+
+/// Create an EGL display on the DRM render node at `path` using EGL_EXT_platform_device.
+unsafe fn egl_display_for_render_node(path: &Path) -> anyhow::Result<EGLDisplay> {
+    let node =
+        DrmNode::from_path(path).with_context(|| format!("error opening {path:?} as DRM node"))?;
+
+    let device = EGLDevice::enumerate()?
+        .find(|device| device.try_get_render_node().ok().flatten() == Some(node))
+        .with_context(|| format!("no EGL device found for render node {node}"))?;
+
+    EGLDisplay::new(device).with_context(|| format!("error creating EGL display for {node}"))
 }
 
 #[cfg(feature = "xdp-gnome-screencast")]
