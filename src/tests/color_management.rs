@@ -100,7 +100,7 @@ fn fixture_with_hdr_mode_on() -> Fixture {
     config.outputs.0.push(Output {
         name: "headless-1".to_owned(),
         hdr: Some(Hdr {
-            mode: HdrMode::On,
+            mode: Some(HdrMode::On),
             ..Default::default()
         }),
         ..Default::default()
@@ -163,9 +163,20 @@ fn feedback_preferred_is_pq_with_mode_on() {
     assert_eq!(client.state.info_primaries, Some(Primaries::Bt2020));
 }
 
-/// Fixture whose output is `hdr mode="auto"` (the default) with backend HDR capabilities injected.
+/// Fixture whose output is `hdr mode="auto"` with backend HDR capabilities injected.
 fn fixture_with_hdr_mode_auto() -> Fixture {
-    let mut f = fixture_with_hdr();
+    use niri_config::output::HdrMode;
+
+    let mut config = Config::default();
+    config.outputs.0.push(Output {
+        name: "headless-1".to_owned(),
+        hdr: Some(Hdr {
+            mode: Some(HdrMode::Auto),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let mut f = Fixture::with_config(config);
     f.add_output(1, (1920, 1080));
     f.niri_output(1)
         .user_data()
@@ -444,6 +455,514 @@ fn output_description_luminances_satisfy_wine_hdr_check() {
         max_target_lum > reference_lum,
         "wine's HDR display detection requires max target luminance > reference white"
     );
+}
+
+#[test]
+fn auto_mode_advertises_hdr_capability_while_sdr() {
+    // In auto mode with HDR not engaged, the output must still report its HDR capability:
+    // winewayland reads "max target luminance > reference white" from these events once at
+    // startup, before any fullscreen HDR content exists, and otherwise never enables its HDR
+    // path. The capability rides on the *target* volume (which the spec allows to exceed the
+    // primary volume), while the primary volume and transfer function stay honest about the
+    // SDR connector: 1.0 is SDR white at the protocol's 80 cd/m² default.
+    let mut f = fixture_with_hdr_mode_auto();
+
+    let id = f.add_client();
+    f.double_roundtrip(id);
+
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+
+    let client = f.client(id);
+    assert_eq!(client.state.info_tf, Some(TransferFunction::Srgb));
+    assert_eq!(client.state.info_primaries, Some(Primaries::Srgb));
+    // The honest sRGB primary volume defaults (0.2 / 80 / 80 cd/m²).
+    assert_eq!(client.state.info_luminances, Some((2000, 80, 80)));
+    // The injected EDID range as the target volume.
+    assert_eq!(client.state.info_target_luminance, Some((100, 800)));
+    let (_, max_target_lum) = client
+        .state
+        .info_target_luminance
+        .expect("the target_luminance info event must be sent");
+    assert!(
+        max_target_lum > 80,
+        "wine's HDR display detection must pass while auto mode is not engaged"
+    );
+}
+
+#[test]
+fn auto_active_fullscreen_hdr_engages() {
+    // The engagement invariant of auto mode: the connector engages only while the *active*
+    // fullscreen window carries HDR content.
+    let mut f = fixture_with_hdr_mode_auto();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+
+    // Fullscreen but no HDR content yet: not engaged.
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_none(),
+        "a fullscreen window without HDR content must not engage HDR"
+    );
+
+    f.client(id).create_and_attach_hdr_description(
+        &surface,
+        TransferFunction::St2084Pq,
+        Primaries::Bt2020,
+        RenderIntent::Perceptual,
+    );
+    f.client(id).window(&surface).surface.commit();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_some(),
+        "an active fullscreen HDR window must engage HDR in auto mode"
+    );
+    assert!(
+        f.niri().output_blend_description(&output).is_hdr(),
+        "the blend space must be HDR while engaged"
+    );
+}
+
+/// Attaches a PQ/BT.2020 description to `surface` and commits it.
+fn attach_hdr_description(f: &mut Fixture, id: ClientId, surface: &WlSurface) {
+    f.client(id).create_and_attach_hdr_description(
+        surface,
+        TransferFunction::St2084Pq,
+        Primaries::Bt2020,
+        RenderIntent::Perceptual,
+    );
+    f.client(id).window(surface).surface.commit();
+    f.double_roundtrip(id);
+}
+
+/// Drops the color-management image description on `surface` and commits, so the window
+/// stops carrying HDR content (no description means sRGB; the v2 protocol has no sRGB
+/// name to attach).
+fn unset_surface_description(f: &mut Fixture, id: ClientId, surface: &WlSurface) {
+    f.client(id).unset_surface_image_description(surface);
+    f.client(id).window(surface).surface.commit();
+    f.double_roundtrip(id);
+}
+
+/// Replaces `surface`'s image description with a parametric SDR one (named TF and
+/// primaries, no mastering metadata — the protocol rejects mastering fields with SDR
+/// transfer functions) and commits.
+fn attach_sdr_description(
+    f: &mut Fixture,
+    id: ClientId,
+    surface: &WlSurface,
+    tf: TransferFunction,
+    primaries: Primaries,
+) {
+    f.client(id).create_and_attach_sdr_description(
+        surface,
+        tf,
+        primaries,
+        RenderIntent::Perceptual,
+    );
+    f.client(id).window(surface).surface.commit();
+    f.double_roundtrip(id);
+}
+
+/// Takes `surface`'s window out of fullscreen. The unfullscreen lands only once the
+/// client has acked the resulting configure and committed, and unfullscreening sends
+/// exactly one configure, so this is a single ack-and-commit round after it arrives.
+fn unfullscreen_window(f: &mut Fixture, id: ClientId, surface: &WlSurface) {
+    f.client(id).window(surface).unset_fullscreen();
+    f.double_roundtrip(id);
+    f.client(id).window(surface).ack_last_and_commit();
+    f.double_roundtrip(id);
+}
+
+#[test]
+fn auto_hdr_disengages_on_leaving_fullscreen() {
+    // Leaving fullscreen must drop the connector back to SDR (HDR that never reverts is a
+    // known failure mode of auto-HDR implementations), and re-entering must engage it
+    // again. The headless decision is immediate; the brief exit grace that rides out a
+    // momentary description gap lives in the TTY backend and can only be verified on
+    // hardware.
+    let mut f = fixture_with_hdr_mode_auto();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+    attach_hdr_description(&mut f, id, &surface);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_some(),
+        "precondition: engaged",
+    );
+
+    // Leave fullscreen.
+    unfullscreen_window(&mut f, id, &surface);
+
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_none(),
+        "leaving fullscreen must disengage HDR"
+    );
+    assert!(
+        !f.niri().output_blend_description(&output).is_hdr(),
+        "the blend space must return to SDR after disengaging"
+    );
+
+    // Re-enter fullscreen: engages again. The fullscreen configure arrives after the
+    // request, so let it land before acking it.
+    f.client(id).window(&surface).set_fullscreen(None);
+    f.double_roundtrip(id);
+    f.client(id).window(&surface).ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_some(),
+        "re-entering fullscreen with HDR content must engage HDR again"
+    );
+}
+
+#[test]
+fn auto_hdr_disengages_on_losing_focus() {
+    // Losing focus must disengage: engagement requires the *active* fullscreen window.
+    let mut f = fixture_with_hdr_mode_auto();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+    attach_hdr_description(&mut f, id, &surface);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_some(),
+        "precondition: engaged",
+    );
+
+    // A second window opens and takes focus. niri doesn't steal focus from an active
+    // fullscreen window, so move focus explicitly (same dance as the inactive test).
+    let id2 = f.add_client();
+    let other = f.client(id2).create_window();
+    let other_surface = other.surface.clone();
+    other.commit();
+    f.roundtrip(id2);
+    let other = f.client(id2).window(&other_surface);
+    other.attach_new_buffer();
+    other.ack_last_and_commit();
+    f.double_roundtrip(id2);
+    f.niri().layout.focus_right();
+    f.double_roundtrip(id2);
+
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_none(),
+        "losing focus must disengage HDR"
+    );
+    assert!(
+        !f.niri().output_blend_description(&output).is_hdr(),
+        "the blend space must return to SDR after losing focus"
+    );
+}
+
+#[test]
+fn auto_hdr_disengages_when_content_stops_being_hdr() {
+    // The window stays fullscreen and focused, but drops its HDR description
+    // (e.g. the game turns HDR off mid-game): the connector must disengage.
+    let mut f = fixture_with_hdr_mode_auto();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+    attach_hdr_description(&mut f, id, &surface);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_some(),
+        "precondition: engaged",
+    );
+
+    unset_surface_description(&mut f, id, &surface);
+
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_none(),
+        "an HDR description replaced by an sRGB one must disengage HDR"
+    );
+    assert!(
+        !f.niri().output_blend_description(&output).is_hdr(),
+        "the blend space must return to SDR when the content stops being HDR"
+    );
+}
+
+#[test]
+fn auto_hdr_disengages_when_content_switches_to_gamma22() {
+    // A game that turns HDR off in its menu usually re-attaches a parametric SDR
+    // description over the PQ one, rather than unsetting it: v2 names that TF gamma22
+    // (the v1 srgb name is deprecated and hidden at v2). The connector must disengage.
+    let mut f = fixture_with_hdr_mode_auto();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+    attach_hdr_description(&mut f, id, &surface);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_some(),
+        "precondition: engaged",
+    );
+
+    attach_sdr_description(
+        &mut f,
+        id,
+        &surface,
+        TransferFunction::Gamma22,
+        Primaries::Srgb,
+    );
+
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_none(),
+        "a gamma22 description over the PQ one must disengage HDR"
+    );
+    assert!(
+        !f.niri().output_blend_description(&output).is_hdr(),
+        "the blend space must return to SDR when the content stops being HDR"
+    );
+}
+
+#[test]
+fn auto_windowed_hdr_content_does_not_engage() {
+    // Windowed HDR content stays SDR: an active (focused) windowed window carrying an HDR
+    // description must not engage the connector; the compositor renders it through the
+    // existing HDR→SDR conversion path (pixel-level correctness of that path is
+    // visual-test/hardware territory, the decision is what's checked here).
+    let mut f = fixture_with_hdr_mode_auto();
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    attach_hdr_description(&mut f, id, &surface);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_none(),
+        "a windowed (not fullscreen) HDR window must not engage the connector"
+    );
+    assert!(
+        !f.niri().output_blend_description(&output).is_hdr(),
+        "the blend space must stay SDR for windowed HDR content"
+    );
+
+    // And the client is told the output is SDR (capability on the target volume only).
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+    let client = f.client(id);
+    assert_eq!(client.state.info_tf, Some(TransferFunction::Srgb));
+    assert_eq!(client.state.info_luminances, Some((2000, 80, 80)));
+}
+
+#[test]
+fn auto_advertised_target_volume_stable_across_engage() {
+    // The advertised description does change on engage/disengage — the transfer function
+    // must stay honest about what the connector expects — but everything winewayland
+    // derives Windows' HDR state from (target luminance vs. reference white, and the EDID
+    // fields: target primaries, MaxCLL/MaxFALL) is identical in both states. So its
+    // supports_hdr flag and synthesized EDID don't change, and the image_description_changed
+    // event that fires on the flip does not reconfigure the Windows display mid-game.
+    let mut f = fixture_with_hdr_mode_auto();
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+    let not_engaged = (
+        f.client(id).state.info_luminances,
+        f.client(id).state.info_target_luminance,
+    );
+    assert_eq!(not_engaged, (Some((2000, 80, 80)), Some((100, 800))));
+
+    let changes_before = f.client(id).state.output_image_description_changed;
+
+    attach_hdr_description(&mut f, id, &surface);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_some(),
+        "precondition: engaged",
+    );
+    assert!(
+        f.client(id).state.output_image_description_changed > changes_before,
+        "engaging changes the advertised description, so clients must be notified"
+    );
+
+    // Re-query after the change: PQ now, EDID luminances, and the same target volume.
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+    let client = f.client(id);
+    assert_eq!(client.state.info_tf, Some(TransferFunction::St2084Pq));
+    assert_eq!(client.state.info_luminances, Some((100, 800, 203)));
+    assert_eq!(
+        client.state.info_target_luminance, not_engaged.1,
+        "the target volume must not change across engage"
+    );
+    // Wine's check holds in the engaged state too: 800 > 203.
+    let (_, max_target) = client.state.info_target_luminance.unwrap();
+    assert!(max_target > 203);
+
+    // Disengage (leave fullscreen) and check the flip back.
+    let changes_mid = f.client(id).state.output_image_description_changed;
+    unfullscreen_window(&mut f, id, &surface);
+    assert!(
+        f.client(id).state.output_image_description_changed > changes_mid,
+        "disengaging must notify clients too"
+    );
+
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+    let client = f.client(id);
+    assert_eq!(
+        (
+            client.state.info_luminances,
+            client.state.info_target_luminance
+        ),
+        not_engaged,
+        "the description must return to exactly the not-engaged advertisement"
+    );
+}
+
+#[test]
+fn hdr_mode_change_emits_image_description_changed() {
+    // Flipping the hdr mode at config reload must notify clients about the output whose
+    // advertised description changed (capability appears/disappears).
+    use niri_config::output::HdrMode;
+
+    let mut f = fixture_with_hdr_mode_auto();
+
+    let id = f.add_client();
+    f.double_roundtrip(id);
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).state.info_target_luminance, Some((100, 800)));
+
+    let changes_before = f.client(id).state.output_image_description_changed;
+
+    // auto → off.
+    {
+        let mut config = f.niri().config.borrow_mut();
+        let output = config
+            .outputs
+            .0
+            .iter_mut()
+            .find(|o| o.name == "headless-1")
+            .expect("fixture output");
+        output.hdr = Some(Hdr {
+            mode: Some(HdrMode::Off),
+            ..Default::default()
+        });
+    }
+    f.niri().refresh_color_management();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.client(id).state.output_image_description_changed > changes_before,
+        "auto → off must emit image_description_changed"
+    );
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+    let client = f.client(id);
+    assert_eq!(client.state.info_luminances, Some((2000, 80, 80)));
+    assert_eq!(
+        client.state.info_target_luminance,
+        Some((2000, 80)),
+        "an off output must not advertise an extended target volume"
+    );
+
+    // off → auto.
+    let changes_mid = f.client(id).state.output_image_description_changed;
+    {
+        let mut config = f.niri().config.borrow_mut();
+        let output = config
+            .outputs
+            .0
+            .iter_mut()
+            .find(|o| o.name == "headless-1")
+            .expect("fixture output");
+        output.hdr = Some(Hdr {
+            mode: Some(HdrMode::Auto),
+            ..Default::default()
+        });
+    }
+    f.niri().refresh_color_management();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.client(id).state.output_image_description_changed > changes_mid,
+        "off → auto must emit image_description_changed"
+    );
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).state.info_target_luminance, Some((100, 800)));
+}
+
+#[test]
+fn off_mode_never_engages() {
+    // `hdr mode="off"` (the default): even an active fullscreen window with an HDR
+    // description must not engage the connector; the output advertises plain SDR and no
+    // window is ever told to prefer PQ.
+    use niri_config::output::HdrMode;
+
+    let mut config = Config::default();
+    config.outputs.0.push(Output {
+        name: "headless-1".to_owned(),
+        hdr: Some(Hdr {
+            mode: Some(HdrMode::Off),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+    f.niri_output(1)
+        .user_data()
+        .insert_if_missing(|| OutputHdrCaps {
+            supported: true,
+            max_luminance: 800,
+            min_luminance: 100,
+            max_frame_avg_luminance: 600,
+        });
+
+    let id = f.add_client();
+    let surface = fullscreen_window(&mut f, id);
+    f.client(id).create_and_attach_hdr_description(
+        &surface,
+        TransferFunction::St2084Pq,
+        Primaries::Bt2020,
+        RenderIntent::Perceptual,
+    );
+    f.client(id).window(&surface).surface.commit();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    assert!(
+        f.niri().output_hdr_image_description(&output).is_none(),
+        "mode off must never engage HDR"
+    );
+    assert!(
+        !f.niri().output_blend_description(&output).is_hdr(),
+        "mode off must keep the blend space SDR"
+    );
+
+    // The client is told plain SDR — no capability claim.
+    f.client(id).probe_output_color_management();
+    f.double_roundtrip(id);
+    let client = f.client(id);
+    assert_eq!(client.state.info_tf, Some(TransferFunction::Srgb));
+    assert_eq!(client.state.info_luminances, Some((2000, 80, 80)));
+
+    // And the fullscreen window is not told to prefer PQ.
+    f.client(id).probe_surface_preferred(&surface);
+    f.double_roundtrip(id);
+    assert_eq!(f.client(id).state.info_tf, Some(TransferFunction::Srgb));
 }
 
 #[test]

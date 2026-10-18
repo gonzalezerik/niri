@@ -485,6 +485,15 @@ impl Config {
         Self::parse(path, &contents).map_config_res(|res| {
             let config = res.context("error parsing")?;
             debug!("loaded config from {path:?}");
+            for output in &config.outputs.0 {
+                if output.hdr.as_ref().is_some_and(|hdr| hdr.mode.is_none()) {
+                    warn!(
+                        "output {:?}: the hdr node has no mode, so HDR is off; \
+                         set mode=\"auto\" or mode=\"on\" to enable HDR on it",
+                        output.name
+                    );
+                }
+            }
             Ok(config)
         })
     }
@@ -643,6 +652,43 @@ mod tests {
         let config = Config::parse_mem("").unwrap();
         assert_eq!(config.input.keyboard.repeat_delay, 600);
         assert_eq!(config.input.keyboard.repeat_rate, 25);
+    }
+
+    #[test]
+    fn parse_hdr_modes() {
+        use crate::output::HdrMode;
+
+        let parsed = do_parse(
+            r#"
+            output "e1" { hdr; }
+            output "e2" { hdr mode="off"; }
+            output "e3" { hdr mode="auto"; }
+            output "e4" { hdr mode="on"; }
+            "#,
+        );
+
+        let modes = parsed
+            .outputs
+            .0
+            .iter()
+            .map(|o| o.hdr.as_ref().map(|h| h.mode()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modes,
+            vec![
+                // A bare `hdr` node defaults to off.
+                Some(HdrMode::Off),
+                Some(HdrMode::Off),
+                Some(HdrMode::Auto),
+                Some(HdrMode::On),
+            ]
+        );
+
+        // An invalid mode is rejected.
+        assert!(
+            Config::parse_mem(r#"output "e1" { hdr mode="sometimes"; }"#).is_err(),
+            "an invalid hdr mode must fail to parse"
+        );
     }
 
     #[track_caller]
@@ -1210,7 +1256,9 @@ mod tests {
                         ),
                         hdr: Some(
                             Hdr {
-                                mode: On,
+                                mode: Some(
+                                    On,
+                                ),
                                 reference_luminance: Some(
                                     FloatOrInt(
                                         203.0,

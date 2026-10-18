@@ -91,6 +91,13 @@ pub struct State {
     pub info_luminances: Option<(u32, u32, u32)>,
     /// Last received target_luminance info event as (min ×10000, max).
     pub info_target_luminance: Option<(u32, u32)>,
+    /// Output color-management objects kept alive so image_description_changed events arrive.
+    pub color_management_outputs: Vec<WpColorManagementOutputV1>,
+    /// Per-surface color-management objects; the protocol allows only one per wl_surface,
+    /// so they must be created once and reused.
+    pub color_management_surfaces: Vec<(WlSurface, WpColorManagementSurfaceV1)>,
+    /// Count of image_description_changed events received on output objects.
+    pub output_image_description_changed: usize,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -300,6 +307,9 @@ impl Client {
             info_primaries: None,
             info_luminances: None,
             info_target_luminance: None,
+            color_management_outputs: Vec::new(),
+            color_management_surfaces: Vec::new(),
+            output_image_description_changed: 0,
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -346,6 +356,8 @@ impl Client {
         let output = self.state.outputs.keys().next().expect("no output").clone();
 
         let output_cm = manager.get_output(&output, &self.qh, ());
+        // Keep the output object alive so image_description_changed events arrive later.
+        self.state.color_management_outputs.push(output_cm.clone());
         let image = output_cm.get_image_description(&self.qh, ());
         let _info = image.get_information(&self.qh, ());
         self.connection.flush().unwrap();
@@ -416,7 +428,7 @@ impl Client {
         creator.set_max_fall(400);
         let image = creator.create(&self.qh, ());
 
-        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        let cm_surface = self.cm_surface(surface);
         cm_surface.set_image_description(&image, intent);
         self.connection.flush().unwrap();
     }
@@ -425,6 +437,56 @@ impl Client {
     /// additionally sets BT.2020 mastering display primaries — a target color volume that
     /// requires the `extended_target_volume` feature whenever it exceeds the container
     /// primaries.
+    /// The `wp_color_management_surface_v1` for `surface`, creating it on first use. The
+    /// protocol forbids a second one per wl_surface, so every helper must share this.
+    pub fn cm_surface(&mut self, surface: &WlSurface) -> WpColorManagementSurfaceV1 {
+        if let Some((_, s)) = self
+            .state
+            .color_management_surfaces
+            .iter()
+            .find(|(s, _)| s == surface)
+        {
+            return s.clone();
+        }
+
+        let manager = self.state.color_manager.clone().expect("manager not bound");
+        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        self.state
+            .color_management_surfaces
+            .push((surface.clone(), cm_surface.clone()));
+        cm_surface
+    }
+
+    /// Builds a parametric SDR image description (named TF and primaries; mastering
+    /// fields are omitted because the protocol rejects them with SDR transfer
+    /// functions) and attaches it to `surface`.
+    pub fn create_and_attach_sdr_description(
+        &mut self,
+        surface: &WlSurface,
+        tf: TransferFunction,
+        primaries: Primaries,
+        intent: RenderIntent,
+    ) {
+        let manager = self.state.color_manager.clone().expect("manager not bound");
+
+        let creator = manager.create_parametric_creator(&self.qh, ());
+        creator.set_tf_named(tf);
+        creator.set_primaries_named(primaries);
+        let image = creator.create(&self.qh, ());
+
+        let cm_surface = self.cm_surface(surface);
+        cm_surface.set_image_description(&image, intent);
+        self.connection.flush().unwrap();
+    }
+
+    /// Unsets the color-management image description on `surface`, so it stops carrying
+    /// HDR content (no description means sRGB).
+    pub fn unset_surface_image_description(&mut self, surface: &WlSurface) {
+        let cm_surface = self.cm_surface(surface);
+        cm_surface.unset_image_description();
+        self.connection.flush().unwrap();
+    }
+
     pub fn create_and_attach_hdr_description_with_target_volume(
         &mut self,
         surface: &WlSurface,
@@ -444,7 +506,7 @@ impl Client {
         creator.set_mastering_luminance(50, 1000);
         let image = creator.create(&self.qh, ());
 
-        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        let cm_surface = self.cm_surface(surface);
         cm_surface.set_image_description(&image, intent);
         self.connection.flush().unwrap();
     }
@@ -466,7 +528,7 @@ impl Client {
         creator.set_primaries(r.0, r.1, g.0, g.1, b.0, b.1, w.0, w.1);
         let image = creator.create(&self.qh, ());
 
-        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        let cm_surface = self.cm_surface(surface);
         cm_surface.set_image_description(&image, intent);
         self.connection.flush().unwrap();
     }
@@ -477,7 +539,7 @@ impl Client {
         let manager = self.state.color_manager.clone().expect("manager not bound");
 
         let image = manager.create_windows_scrgb(&self.qh, ());
-        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        let cm_surface = self.cm_surface(surface);
         cm_surface.set_image_description(&image, RenderIntent::Perceptual);
         self.connection.flush().unwrap();
     }
@@ -489,7 +551,7 @@ impl Client {
         let manager = self.state.color_manager.clone().expect("manager not bound");
 
         let image = manager.create_windows_bt2100(&self.qh, ());
-        let cm_surface = manager.get_surface(surface, &self.qh, ());
+        let cm_surface = self.cm_surface(surface);
         cm_surface.set_image_description(&image, RenderIntent::Perceptual);
         self.connection.flush().unwrap();
     }
@@ -1281,13 +1343,19 @@ impl Dispatch<WpColorManagerV1, ()> for State {
 
 impl Dispatch<WpColorManagementOutputV1, ()> for State {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         _proxy: &WpColorManagementOutputV1,
-        _event: wp_color_management_output_v1::Event,
+        event: wp_color_management_output_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+        if matches!(
+            event,
+            wp_color_management_output_v1::Event::ImageDescriptionChanged
+        ) {
+            state.output_image_description_changed += 1;
+        }
     }
 }
 

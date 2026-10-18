@@ -754,7 +754,7 @@ impl ColorManagementHandler for State {
     }
 
     fn description_for_output(&mut self, output: &Output) -> ImageDescription {
-        self.niri.output_blend_description(output)
+        self.niri.output_advertised_description(output)
     }
 
     fn preferred_description_for_surface(&mut self, surface: &WlSurface) -> ImageDescription {

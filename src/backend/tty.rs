@@ -2420,7 +2420,7 @@ impl Tty {
             let max_bpc = output_config
                 .map(|o| effective_max_bpc(o, &surface.max_bpc_range))
                 .unwrap_or(None);
-            let always_on = hdr_config.as_ref().is_some_and(|h| h.mode == HdrMode::On);
+            let always_on = hdr_config.as_ref().is_some_and(|h| h.mode() == HdrMode::On);
             let reference_luminance = hdr_config
                 .as_ref()
                 .and_then(|h| h.reference_luminance)

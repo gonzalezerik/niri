@@ -145,27 +145,43 @@ pub struct Vrr {
 
 /// HDR (high dynamic range) output configuration.
 ///
-/// Presence of the `hdr` node enables HDR signalling on the output: niri will request a 10-bit (or
-/// wider) scanout buffer, set the connector `Colorspace` to BT.2020 RGB, and attach an
-/// `HDR_OUTPUT_METADATA` infoframe advertising the PQ (SMPTE ST 2084) transfer function. This is
-/// only acted upon for outputs whose driver exposes the corresponding DRM connector properties.
+/// Presence of the `hdr` node opts the output into HDR: niri advertises color management to
+/// clients, and — depending on `mode` — requests a 10-bit (or wider) scanout buffer, sets the
+/// connector `Colorspace` to BT.2020 RGB, and attaches an `HDR_OUTPUT_METADATA` infoframe
+/// advertising the PQ (SMPTE ST 2084) transfer function. This is only acted upon for outputs
+/// whose driver exposes the corresponding DRM connector properties.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
 pub struct Hdr {
-    /// When HDR engages on this output.
-    #[knuffel(property, str, default)]
-    pub mode: HdrMode,
+    /// When HDR engages on this output. An `hdr` node without `mode` means off.
+    #[knuffel(property, str)]
+    pub mode: Option<HdrMode>,
     /// Luminance, in cd/m² (nits), that SDR white (the value 1.0) is mapped to while the output is
     /// in HDR mode. Defaults to 203 cd/m² (the BT.2408 reference white) when unset.
     #[knuffel(child, unwrap(argument))]
     pub reference_luminance: Option<FloatOrInt<0, 10000>>,
 }
 
+impl Hdr {
+    /// The configured mode. An `hdr` node without `mode` means [`HdrMode::Off`].
+    pub fn mode(&self) -> HdrMode {
+        self.mode.unwrap_or_default()
+    }
+}
+
 /// When HDR engages on an `hdr`-enabled output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HdrMode {
-    /// HDR is signalled while a fullscreen surface with an HDR image description is shown, and the
-    /// output stays SDR otherwise.
+    /// The output never engages HDR: it stays an SDR output, and HDR content is shown
+    /// correctly as SDR.
     #[default]
+    Off,
+    /// The output advertises its HDR capability to clients at all times (its luminance range
+    /// in the output description, and PQ support in the color management globals), so that
+    /// applications which probe HDR support once at startup — Windows games under Wine,
+    /// native Vulkan games, video players — enable their HDR path on their own. The
+    /// connector switches to HDR while the focused window is fullscreen and carries HDR
+    /// content, and back to SDR when it leaves fullscreen, loses focus, or stops carrying
+    /// HDR content. Windowed HDR content is shown as SDR without switching.
     Auto,
     /// The output is always in HDR: the connector stays in BT.2020 + PQ, SDR content is
     /// composited into the HDR blend space, and clients are told upfront that the output prefers
@@ -179,10 +195,11 @@ impl std::str::FromStr for HdrMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "off" => Ok(Self::Off),
             "auto" => Ok(Self::Auto),
             "on" => Ok(Self::On),
             _ => Err(miette::miette!(
-                r#"invalid HDR mode, can be "auto" or "on""#
+                r#"invalid HDR mode, can be "off", "auto" or "on""#
             )),
         }
     }

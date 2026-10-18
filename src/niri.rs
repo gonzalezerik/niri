@@ -74,8 +74,8 @@ use smithay::utils::{
 };
 use smithay::wayland::background_effect::BackgroundEffectState;
 use smithay::wayland::color::management::{
-    ColorManagementState, ColorManagementSurfaceCachedState, Feature, ImageDescription,
-    Primaries as CmPrimaries, PrimariesOption as CmPrimariesOption, RenderIntent,
+    Chromaticities, ColorManagementState, ColorManagementSurfaceCachedState, Feature,
+    ImageDescription, Primaries as CmPrimaries, PrimariesOption as CmPrimariesOption, RenderIntent,
     TransferFunction as CmTransferFunction,
 };
 use smithay::wayland::compositor::{
@@ -2501,6 +2501,11 @@ impl Niri {
     /// presents Vulkan content on a subsurface of the toplevel and attaches the HDR image
     /// description there.
     pub fn output_hdr_image_description(&self, output: &Output) -> Option<ImageDescription> {
+        // With `hdr mode="off"`, the connector never engages HDR, no matter what is on screen.
+        let (hdr, _) = self.output_hdr_config(output)?;
+        if hdr.mode() == HdrMode::Off {
+            return None;
+        }
         let window = self.layout.monitor_for_output(output)?.active_window()?;
         if !window.sizing_mode().is_fullscreen() {
             return None;
@@ -2562,12 +2567,14 @@ impl Niri {
     ///
     /// With `hdr mode="on"`, an HDR-capable output always reports its PQ/BT.2020 description.
     /// In auto mode it reports PQ only while HDR is actually engaged (fullscreen HDR content),
-    /// so clients are never told the output is in HDR before the connector is.
+    /// so clients are never told the output is in HDR before the connector is. With
+    /// `hdr mode="off"` (the default) the output is always SDR.
     pub fn output_blend_description(&self, output: &Output) -> ImageDescription {
         let Some((hdr, caps)) = self.output_hdr_config(output) else {
             return ImageDescription::SRGB;
         };
-        match hdr.mode {
+        match hdr.mode() {
+            HdrMode::Off => ImageDescription::SRGB,
             HdrMode::On => Self::hdr_blend_description(&hdr, caps),
             HdrMode::Auto => {
                 if self.output_hdr_image_description(output).is_some() {
@@ -2576,6 +2583,58 @@ impl Niri {
                     ImageDescription::SRGB
                 }
             }
+        }
+    }
+
+    /// The image description advertised to clients via `wp_color_management_output_v1`.
+    ///
+    /// Same as [`Self::output_blend_description`], except in auto mode while HDR is *not*
+    /// engaged: there the primary color volume stays the honest sRGB one — the connector
+    /// expects sRGB-encoded pixels with 1.0 at the protocol's default 80 cd/m² reference
+    /// white — and the sink's HDR capability rides on the *target* volume instead, which the
+    /// spec explicitly allows to exceed the primary volume (extended target volume). That is
+    /// what lets clients which probe HDR capability once at startup enable their HDR path on
+    /// their own: Wine's winewayland backend decides "HDR capable" from the target luminance
+    /// max exceeding the reference white, and re-checks on every `image_description_changed`.
+    /// The target primaries, target luminance range and MaxCLL/MaxFALL are kept identical to
+    /// the engaged description, so the EDID winewayland synthesizes from them (primaries in
+    /// the base block, MaxCLL/MaxFALL in the CTA HDR block) doesn't change bytes when HDR
+    /// engages or disengages, and Windows' HDR state stays put mid-game.
+    pub fn output_advertised_description(&self, output: &Output) -> ImageDescription {
+        let blend = self.output_blend_description(output);
+        if blend.transfer == CmTransferFunction::St2084Pq {
+            return blend;
+        }
+        let Some((hdr, caps)) = self.output_hdr_config(output) else {
+            return blend;
+        };
+        if hdr.mode() != HdrMode::Auto {
+            // mode "off": plain SDR, no capability claim. mode "on" already returned above.
+            return blend;
+        }
+        // The primary volume must describe the current encoding, so it stays at the sRGB
+        // defaults (0.2 cd/m² min, 80 cd/m² max, 80 cd/m² reference white). The configured
+        // `reference-luminance` is deliberately not used here: it says where SDR white sits
+        // *while the connector is in HDR*; while it is SDR, 1.0 is SDR white at the SDR
+        // level, and claiming otherwise would show surfaces tagged with this description
+        // too dark. The sink's EDID range goes into the target volume as SMPTE ST 2086
+        // mastering display data. Same placeholder as hdr_blend_description() uses for
+        // sinks whose EDID doesn't provide luminance data.
+        let max_luminance = if caps.max_luminance > 0 {
+            u32::from(caps.max_luminance)
+        } else {
+            500
+        };
+        ImageDescription {
+            // BT.2020 target primaries, matching what the engaged description sends (its
+            // BT.2020 container primaries); the connector programs BT.2020 RGB for HDR.
+            mastering_primaries: Some(Chromaticities::from_named(CmPrimaries::Bt2020)),
+            mastering_luminance: Some((u32::from(caps.min_luminance), max_luminance)),
+            // Match hdr_blend_description() so winewayland's EDID is stable across the flip.
+            max_cll: (caps.max_luminance > 0).then(|| u32::from(caps.max_luminance)),
+            max_fall: (caps.max_frame_avg_luminance > 0)
+                .then(|| u32::from(caps.max_frame_avg_luminance)),
+            ..blend
         }
     }
 
@@ -2605,7 +2664,8 @@ impl Niri {
         let Some((hdr, caps)) = self.output_hdr_config(output) else {
             return ImageDescription::SRGB;
         };
-        match hdr.mode {
+        match hdr.mode() {
+            HdrMode::Off => ImageDescription::SRGB,
             HdrMode::On => Self::hdr_blend_description(&hdr, caps),
             HdrMode::Auto => {
                 // Count a window as fullscreen once fullscreen has been requested of it, not only
@@ -2654,7 +2714,9 @@ impl Niri {
 
         let outputs: Vec<Output> = self.global_space.outputs().cloned().collect();
         for output in &outputs {
-            let desc = self.output_blend_description(output);
+            // Compare the *advertised* description: that's what clients are told, and
+            // `image_description_changed` must fire exactly when it changes.
+            let desc = self.output_advertised_description(output);
             let Some(state) = self.output_state.get_mut(output) else {
                 continue;
             };
