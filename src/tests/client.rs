@@ -28,6 +28,14 @@ use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1;
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_info_v1::{self, WpImageDescriptionInfoV1};
 use smithay::reexports::wayland_protocols::wp::color_management::v1::client::wp_image_description_v1::{self, WpImageDescriptionV1};
+use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
+use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
+use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::{
+    ExtImageCopyCaptureManagerV1, Options as ImageCopyCaptureOptions,
+};
+use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1::{
+    self, ExtImageCopyCaptureSessionV1,
+};
 use smithay::reexports::wayland_protocols::wp::presentation_time::client::wp_presentation::{
     self as wp_presentation, WpPresentation,
 };
@@ -114,9 +122,27 @@ pub struct State {
     pub presentation: Option<WpPresentation>,
     pub session_lock_manager: Option<ExtSessionLockManagerV1>,
 
+    pub output_capture_source_manager: Option<ExtOutputImageCaptureSourceManagerV1>,
+    pub image_copy_capture_manager: Option<ExtImageCopyCaptureManagerV1>,
+    /// Capture sessions and their sources, kept alive so constraint events can arrive.
+    pub capture_sources: Vec<ExtImageCaptureSourceV1>,
+    pub capture_sessions: Vec<ExtImageCopyCaptureSessionV1>,
+    /// Buffer constraints per capture session, in creation order.
+    pub capture_constraints: Vec<CaptureConstraints>,
+
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
     pub locks: Vec<Lock>,
+}
+
+/// Buffer constraints received on a capture session, up to the latest `done`.
+#[derive(Debug, Default)]
+pub struct CaptureConstraints {
+    pub size: Option<(u32, u32)>,
+    pub shm_formats: Vec<u32>,
+    pub dmabuf_formats: Vec<(u32, Vec<u64>)>,
+    pub dmabuf_device: bool,
+    pub done: usize,
 }
 
 pub struct Window {
@@ -364,6 +390,11 @@ impl Client {
             output_image_description_changed: 0,
             presentation: None,
             session_lock_manager: None,
+            output_capture_source_manager: None,
+            image_copy_capture_manager: None,
+            capture_sources: Vec::new(),
+            capture_sessions: Vec::new(),
+            capture_constraints: Vec::new(),
             windows: Vec::new(),
             layers: Vec::new(),
             locks: Vec::new(),
@@ -402,6 +433,38 @@ impl Client {
 
     pub fn window(&mut self, surface: &WlSurface) -> &mut Window {
         self.state.window(surface)
+    }
+
+    /// Creates an output capture session for the first output. Returns the index of its
+    /// constraints in `state.capture_constraints`.
+    pub fn create_output_capture_session(&mut self) -> usize {
+        let source_manager = self
+            .state
+            .output_capture_source_manager
+            .clone()
+            .expect("output capture source manager not bound");
+        let manager = self
+            .state
+            .image_copy_capture_manager
+            .clone()
+            .expect("image copy capture manager not bound");
+        let output = self.state.outputs.keys().next().expect("no output").clone();
+
+        let source = source_manager.create_source(&output, &self.qh, ());
+        let idx = self.state.capture_constraints.len();
+        let session = manager.create_session(
+            &source,
+            ImageCopyCaptureOptions::empty(),
+            &self.qh,
+            idx as u32,
+        );
+        self.state.capture_sources.push(source);
+        self.state.capture_sessions.push(session);
+        self.state
+            .capture_constraints
+            .push(CaptureConstraints::default());
+        self.connection.flush().unwrap();
+        idx
     }
 
     /// Drives the color-management requests `wayland-info` sends: bind an output's image
@@ -1065,6 +1128,16 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ExtSessionLockManagerV1::interface().name {
                     let version = min(version, ExtSessionLockManagerV1::interface().version);
                     state.session_lock_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ExtOutputImageCaptureSourceManagerV1::interface().name {
+                    let version = min(
+                        version,
+                        ExtOutputImageCaptureSourceManagerV1::interface().version,
+                    );
+                    state.output_capture_source_manager =
+                        Some(registry.bind(name, version, qh, ()));
+                } else if interface == ExtImageCopyCaptureManagerV1::interface().name {
+                    let version = min(version, ExtImageCopyCaptureManagerV1::interface().version);
+                    state.image_copy_capture_manager = Some(registry.bind(name, version, qh, ()));
                 }
 
                 let global = Global {
@@ -1604,6 +1677,80 @@ impl Dispatch<WpImageDescriptionCreatorParamsV1, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         // No events.
+    }
+}
+
+impl Dispatch<ExtOutputImageCaptureSourceManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtOutputImageCaptureSourceManagerV1,
+        _event: <ExtOutputImageCaptureSourceManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // No events.
+    }
+}
+
+impl Dispatch<ExtImageCaptureSourceV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtImageCaptureSourceV1,
+        _event: <ExtImageCaptureSourceV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // No events.
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtImageCopyCaptureManagerV1,
+        _event: <ExtImageCopyCaptureManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // No events.
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, u32> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
+        &idx: &u32,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let constraints = &mut state.capture_constraints[idx as usize];
+        match event {
+            ext_image_copy_capture_session_v1::Event::BufferSize { width, height } => {
+                constraints.size = Some((width, height));
+            }
+            ext_image_copy_capture_session_v1::Event::ShmFormat { format } => {
+                constraints.shm_formats.push(format.into());
+            }
+            ext_image_copy_capture_session_v1::Event::DmabufDevice { .. } => {
+                constraints.dmabuf_device = true;
+            }
+            ext_image_copy_capture_session_v1::Event::DmabufFormat { format, modifiers } => {
+                let modifiers = modifiers
+                    .chunks_exact(8)
+                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
+                constraints.dmabuf_formats.push((format, modifiers));
+            }
+            ext_image_copy_capture_session_v1::Event::Done => {
+                constraints.done += 1;
+            }
+            _ => {}
+        }
     }
 }
 

@@ -523,6 +523,14 @@ fn auto_active_fullscreen_hdr_engages() {
         f.niri().output_blend_description(&output).is_hdr(),
         "the blend space must be HDR while engaged"
     );
+    // Captures must report the true (engaged PQ) encoding of their pixels.
+    assert_eq!(
+        f.niri().output_capture_blend(&output),
+        crate::render_helpers::CaptureBlend::Pq {
+            reference_luminance: 203.
+        },
+        "captures of an engaged auto output must be tagged PQ"
+    );
 }
 
 /// Attaches a PQ/BT.2020 description to `surface` and commits it.
