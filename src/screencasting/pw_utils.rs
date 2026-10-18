@@ -57,7 +57,7 @@ use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
 use crate::render_helpers::{
     clear_dmabuf, encompassing_geo, render_and_download, render_and_download_with_damage,
-    render_to_dmabuf,
+    render_to_dmabuf, CaptureBlend,
 };
 use crate::screencasting::CastRenderElement;
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
@@ -1318,7 +1318,9 @@ impl Cast {
                         dmabuf,
                         elements,
                         states,
-                        reference_luminance,
+                        CaptureBlend::Sdr {
+                            reference_luminance,
+                        },
                     )
                     .map(|x| (x, SharingBuf::Dma))
                 }

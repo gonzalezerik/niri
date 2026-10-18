@@ -87,6 +87,12 @@ pub fn source_output(source: &ImageCaptureSource) -> Option<Output> {
 
 /// Buffer constraints for capturing an output.
 ///
+/// Color contract: captured dmabuf buffers hold the output's blend-space pixels — PQ/BT.2020
+/// while the output's `wp_color_management_output_v1` image description says PQ, sRGB
+/// otherwise. The buffer format is a precision choice only and never changes the encoding;
+/// HDR captures should use a 10-bit (e.g. `XR30`) or FP16 format to avoid banding. shm buffers
+/// cannot carry a color description, so shm capture is always the SDR tone-map of the output.
+///
 /// `render_node` is the primary renderer's DRM render node (see
 /// `Backend::primary_render_node()`), and only shm will be supported without
 /// one. It is required since querying it from the EGL context fails for the TTY

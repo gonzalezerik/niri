@@ -183,7 +183,7 @@ use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
-    render_to_texture, render_to_vec, shaders, RenderCtx, RenderTarget,
+    render_to_texture, render_to_vec, shaders, CaptureBlend, RenderCtx, RenderTarget,
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
@@ -2757,6 +2757,31 @@ impl Niri {
         desc.luminances
             .map(|(_, _, reference)| reference as f64)
             .unwrap_or(DEFAULT_REFERENCE_LUMINANCE)
+    }
+
+    /// The blend space for dmabuf captures of this output: [`CaptureBlend::Pq`] when the
+    /// output's blend description is PQ — the capture buffer then holds PQ pixels, matching what
+    /// `wp_color_management_output_v1::get_image_description` reports for the output — and
+    /// [`CaptureBlend::Sdr`] with the output's SDR reference white otherwise.
+    ///
+    /// The client's buffer format never enters this decision; it only sets precision. shm
+    /// captures are always SDR tone-mapped regardless (see
+    /// [`Self::output_capture_reference_luminance`]), since shm buffers cannot carry a color
+    /// description.
+    pub(crate) fn output_capture_blend(&self, output: &Output) -> CaptureBlend {
+        let desc = self.output_blend_description(output);
+        if desc.transfer == CmTransferFunction::St2084Pq {
+            CaptureBlend::Pq {
+                reference_luminance: desc
+                    .luminances
+                    .map(|(_, _, reference)| reference as f64)
+                    .unwrap_or(DEFAULT_REFERENCE_LUMINANCE),
+            }
+        } else {
+            CaptureBlend::Sdr {
+                reference_luminance: self.output_capture_reference_luminance(output),
+            }
+        }
     }
 
     /// The image description we'd prefer a window to use, given the output it is on.
@@ -6163,6 +6188,7 @@ impl Niri {
 
                         let reference_luminance =
                             self.output_capture_reference_luminance(screencopy.output());
+                        let blend = self.output_capture_blend(screencopy.output());
                         let render_result = Self::render_for_screencopy_internal(
                             renderer,
                             damage_tracker,
@@ -6170,6 +6196,7 @@ impl Niri {
                             states,
                             screencopy,
                             reference_luminance,
+                            blend,
                         );
                         match render_result {
                             Ok(sync) => {
@@ -6222,6 +6249,7 @@ impl Niri {
         });
 
         let reference_luminance = self.output_capture_reference_luminance(output);
+        let blend = self.output_capture_blend(output);
         let Some(damage_tracker) = self.screencopy_state.damage_tracker(manager) else {
             error!("screencopy queue must not be deleted as long as frames exist");
             bail!("screencopy queue missing");
@@ -6236,6 +6264,7 @@ impl Niri {
             states,
             &screencopy,
             reference_luminance,
+            blend,
         );
         let res = res.map(|sync| screencopy.submit_after_sync(false, sync, &self.event_loop));
 
@@ -6343,14 +6372,14 @@ impl Niri {
 
             let res = match capture_buffer {
                 CaptureBuffer::Dma(dmabuf) => {
-                    let reference_luminance = self.output_capture_reference_luminance(output);
+                    let blend = self.output_capture_blend(output);
                     render_to_dmabuf(
                         renderer,
                         &mut s.damage_tracker,
                         dmabuf,
                         elements,
                         states,
-                        reference_luminance,
+                        blend,
                     )
                     .map(Some)
                 }
@@ -6682,6 +6711,7 @@ impl Niri {
         states: RenderElementStates,
         screencopy: &Screencopy,
         reference_luminance: f64,
+        blend: CaptureBlend,
     ) -> anyhow::Result<Option<SyncPoint>> {
         let sync = match screencopy.buffer() {
             ScreencopyBuffer::Dmabuf(dmabuf) => {
@@ -6691,7 +6721,7 @@ impl Niri {
                     dmabuf.clone(),
                     elements,
                     states,
-                    reference_luminance,
+                    blend,
                 )
                 .context("error rendering to screencopy dmabuf")?;
                 Some(sync)

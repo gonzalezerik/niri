@@ -23,7 +23,7 @@ use solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
 use self::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use self::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::blend::set_sdr_capture_blend;
+use crate::render_helpers::blend::{set_frame_blend, set_sdr_capture_blend};
 use crate::render_helpers::renderer::AsGlesRenderer;
 use crate::render_helpers::xray::Xray;
 
@@ -300,16 +300,39 @@ pub fn render_to_vec(
     Ok(copy.to_vec())
 }
 
+/// The blend space to render a client dmabuf capture in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CaptureBlend {
+    /// SDR pixels; tone-maps to `reference_luminance` if the output frame was PQ.
+    Sdr { reference_luminance: f64 },
+    /// PQ/BT.2020 pixels, matching the source output's `wp_color_management_output_v1`
+    /// image description.
+    Pq { reference_luminance: f64 },
+}
+
+/// Renders into a client dmabuf in the capture blend space.
+///
+/// The buffer holds the output's own encoding: [`CaptureBlend::Pq`] renders PQ/BT.2020 pixels
+/// matching the source output's `wp_color_management_output_v1` image description,
+/// [`CaptureBlend::Sdr`] an SDR tone-map. The buffer format is a precision choice only and
+/// never changes the encoding; HDR captures want 10-bit or FP16 formats to avoid banding.
 pub fn render_to_dmabuf(
     renderer: &mut GlesRenderer,
     damage_tracker: &mut OutputDamageTracker,
     mut dmabuf: Dmabuf,
     elements: &[impl RenderElement<GlesRenderer>],
     states: RenderElementStates,
-    reference_luminance: f64,
+    blend: CaptureBlend,
 ) -> anyhow::Result<SyncPoint> {
     let _span = tracy_client::span!();
-    set_sdr_capture_blend(renderer, reference_luminance);
+    match blend {
+        CaptureBlend::Sdr {
+            reference_luminance,
+        } => set_sdr_capture_blend(renderer, reference_luminance),
+        CaptureBlend::Pq {
+            reference_luminance,
+        } => set_frame_blend(renderer, Some(reference_luminance)),
+    }
     let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
     ensure!(
         dmabuf.width() == size.w as u32 && dmabuf.height() == size.h as u32,
@@ -330,6 +353,9 @@ pub fn render_to_dmabuf(
     Ok(res.sync)
 }
 
+/// Renders into a client shm buffer. shm buffers cannot carry a color description, so this is
+/// always the SDR tone-map of the output, even while the output itself is in HDR;
+/// `reference_luminance` is the output's SDR reference white used for the tone-map.
 pub fn render_to_shm(
     renderer: &mut GlesRenderer,
     damage_tracker: &mut OutputDamageTracker,

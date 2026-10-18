@@ -329,9 +329,10 @@ output "HDMI-A-1" {
 <sup>Since: next release</sup>
 
 > [!CAUTION]
-> HDR support is experimental and currently limited to a **single fullscreen application**.
-> There is no color-managed compositing yet, so HDR will only look correct when one HDR
-> application is fullscreen and alone on the output.
+> HDR support is experimental. In `mode="auto"` the output switches to HDR only while a
+> **focused fullscreen window** carries HDR content; windowed HDR content is tone-mapped
+> to SDR. In `mode="on"` the output is always in HDR, and SDR content is composited into
+> the HDR blend space.
 
 Opts this output into HDR. When present, niri advertises the `wp-color-management-v1` protocol to
 clients (so an HDR app, e.g. `mpv --vo=gpu-next` or gamescope, can tell niri its content is HDR)
@@ -367,8 +368,10 @@ The optional `reference-luminance` child (in cd/m²) is the luminance that SDR w
 an SDR application) is displayed at while the output is in HDR. Defaults to 203 (the BT.2408
 reference); raise it if the SDR desktop looks too dim next to HDR content.
 
-Screenshots and screencasts of HDR outputs are rendered in SDR; HDR application content appears
-washed out in them.
+Screenshots and screencasts of an HDR output are captured in the output's blend space: dmabuf
+captures carry PQ pixels, matching the description the output advertises. shm captures cannot
+carry a color description, so they are tone-mapped to SDR at the output's reference white (the
+`reference-luminance` value, default 203 cd/m²).
 
 ```kdl
 // Automatic HDR on the internal display: fullscreen HDR content switches the output to HDR.
